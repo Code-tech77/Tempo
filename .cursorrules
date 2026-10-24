@@ -1,0 +1,33 @@
+You are working on Tempo, an OxHack 2026 energy scheduling prototype.
+
+Read AGENT.md before editing. Follow it as the repository's engineering policy.
+
+Tempo's primary job is to save users money by matching appliance demand to the cheapest feasible half-hourly energy-price slots within their real schedules. Lead implementation and product decisions with feasible run times, scheduled cost, baseline cost, savings, and the monetary value of flexibility.
+
+schemas.py is a locked cross-team interface. Import its Pydantic models and never duplicate, rename, remove, loosen, or silently extend their fields. Do not edit schemas.py unless the human user explicitly requests a contract change.
+
+Implement the architecture as a narrow translation and validation layer around the existing code:
+- main.py owns API and Gemini integration.
+- scheduler.py owns deterministic timezone validation and the three-scenario wrapper.
+- src/ owns presentation.
+- data_service.py, forecast_engine.py, and backtest_engine.py are black boxes unless the user explicitly puts them in scope.
+
+Non-negotiable behavior:
+- Optimize against price data supplied by the data and forecast pipeline; do not invent scheduler prices.
+- Cost is the primary objective. Carbon weighting and forecast risk may change the recommendation, but their monetary trade-off must remain visible.
+- Calculate savings from an explicit baseline and make every reported saving reproducible from returned cost values.
+- Treat Gemini as a narrow natural-language constraint parser, not the core product or source of energy recommendations.
+- Gemini extracts semantic scenarios; it does not produce calibrated probabilities.
+- Use structured output at temperature 0.0 and validate it again in deterministic Python.
+- Evidence quotes must exist literally in the normalized user prompt.
+- Convert Europe/London wall-clock times to timezone-aware UTC with zoneinfo.
+- Never silently sort, swap, clamp, infer, or repair contradictory deadlines.
+- Handle the repeated autumn 01:00-01:59 hour explicitly and surface the chosen fold or request clarification.
+- Reject impossible power/time requests and deadlines beyond the forecast horizon with an explanatory response.
+- Preserve earliest, expected, and latest scenario identities end to end.
+- Suppress scenario cards when clarification is required.
+- Read secrets only from environment variables and never log or commit them.
+
+Be exact about evidence. Do not call synthetic data historical real-world data, an unsolved model an OR-Tools result, or a UI fallback a live result. Test that the optimizer finds the cheapest feasible slots on controlled price curves, verify every savings calculation, add focused adversarial tests for validation logic, and run relevant tests plus npm run build before reporting completion.
+
+Keep edits scoped. Preserve user changes. Do not modify generated files or perform unrelated refactors.

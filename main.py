@@ -7,10 +7,11 @@ Exposes REST endpoints for:
 - DuckDB Real Historical Backtesting Benchmark
 """
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
+from functools import lru_cache
 import datetime
 import uvicorn
 
@@ -18,12 +19,32 @@ from data_service import DataService
 from forecast_engine import ForecastEngine
 from scheduler import GridScheduler
 from backtest_engine import BacktestEngine
+from gemini_parser import (
+    GeminiScheduleParser,
+    ParserConfigurationError,
+    ParserInputError,
+    ParserOutputError,
+    ParserUnavailableError,
+    ScheduleParser,
+)
+from schemas import ParseAndScheduleRequest, ScheduleExtractionSchema
 
 # Initialize Core Services
 data_service = DataService()
 forecast_engine = ForecastEngine()
 grid_scheduler = GridScheduler()
 backtest_engine = BacktestEngine(data_service)
+
+
+@lru_cache(maxsize=1)
+def get_schedule_parser() -> ScheduleParser:
+    """Return the lazily configured live parser.
+
+    Constructing this dependency never requires an API key, so the rest of the
+    Tempo backend remains usable when Gemini is not configured.
+    """
+
+    return GeminiScheduleParser()
 
 app = FastAPI(
     title="Tempo Energy API",
@@ -109,6 +130,40 @@ def get_forecast():
         "forecast": forecast_slots,
         "weather": weather
     }
+
+
+@app.post(
+    "/api/parse-constraints",
+    response_model=ScheduleExtractionSchema,
+    tags=["Schedule interpretation"],
+    summary="Translate a human schedule into structured constraints",
+)
+def parse_schedule_constraints(
+    payload: ParseAndScheduleRequest,
+    parser: ScheduleParser = Depends(get_schedule_parser),
+):
+    """Stage B integration endpoint.
+
+    This endpoint performs semantic extraction only. It intentionally returns
+    no price, savings, carbon, probability, or run-time recommendation.
+    """
+
+    try:
+        return parser.parse(payload.user_prompt, payload.current_time_iso)
+    except ParserInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ParserConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ParserUnavailableError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini schedule parsing is temporarily unavailable",
+        ) from exc
+    except ParserOutputError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini returned an invalid structured schedule",
+        ) from exc
 
 @app.post("/api/recommend")
 def get_appliance_recommendation(payload: RecommendationRequest):
