@@ -5,11 +5,423 @@ Tempo Google OR-Tools Scheduler & Multi-Household Grid Staggering Simulator
   when thousands of households react to dynamic Agile plunge prices.
 """
 
+from dataclasses import dataclass
+from datetime import datetime, time, timezone
 import math
 import random
+import unicodedata
 import numpy as np
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
+from zoneinfo import ZoneInfo
+
 from ortools.sat.python import cp_model
+
+from schemas import ApplianceType, EvidenceQuotes, ResponseStatus, ScheduleExtractionSchema
+
+
+UTC = timezone.utc
+LONDON_TIMEZONE = ZoneInfo("Europe/London")
+HALF_HOUR_SECONDS = 30 * 60
+
+
+@dataclass(frozen=True)
+class ApplianceProfile:
+    """Physical appliance limits used by deterministic validation."""
+
+    label: str
+    max_power_kw: float
+    requires_contiguous: bool
+
+
+APPLIANCE_PROFILES: Dict[str, ApplianceProfile] = {
+    ApplianceType.EV_CHARGER.value: ApplianceProfile(
+        label="EV Charger",
+        max_power_kw=7.0,
+        requires_contiguous=False,
+    ),
+    ApplianceType.DISHWASHER.value: ApplianceProfile(
+        label="Dishwasher",
+        max_power_kw=1.8,
+        requires_contiguous=True,
+    ),
+    ApplianceType.WASHING_MACHINE.value: ApplianceProfile(
+        label="Washing Machine",
+        max_power_kw=2.0,
+        requires_contiguous=True,
+    ),
+}
+
+
+class LocalTimeConversionError(ValueError):
+    """A Europe/London wall-clock time cannot be used safely."""
+
+
+@dataclass(frozen=True)
+class LocalTimeConversion:
+    """Auditable result of resolving one local wall-clock deadline."""
+
+    local_value: str
+    utc_value: datetime
+    fold: int
+    is_ambiguous: bool
+    warning: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ValidatedScheduleConstraints:
+    """Immutable, timezone-safe input for the Stage D optimizer."""
+
+    start_time_utc: datetime
+    forecast_horizon_end_utc: datetime
+    appliance: str
+    appliance_label: str
+    max_power_kw: float
+    energy_kwh: float
+    run_duration_hours: float
+    required_slots: int
+    is_contiguous: bool
+    earliest_local_deadline: str
+    expected_local_deadline: str
+    latest_local_deadline: str
+    earliest_utc: datetime
+    expected_utc: datetime
+    latest_utc: datetime
+    earliest_fold: int
+    expected_fold: int
+    latest_fold: int
+    quiet_hours_start: Optional[time]
+    quiet_hours_end: Optional[time]
+    evidence_quotes: EvidenceQuotes
+
+
+@dataclass(frozen=True)
+class ValidationOutcome:
+    """Deterministic result before any price optimization is attempted."""
+
+    status: ResponseStatus
+    needs_clarification: bool
+    clarification_message: Optional[str]
+    validation_warning: Optional[str]
+    validated: Optional[ValidatedScheduleConstraints]
+
+    @property
+    def is_valid(self) -> bool:
+        return self.status == ResponseStatus.SUCCESS and self.validated is not None
+
+
+def _clarification(message: str, warning: Optional[str] = None) -> ValidationOutcome:
+    return ValidationOutcome(
+        status=ResponseStatus.NEEDS_CLARIFICATION,
+        needs_clarification=True,
+        clarification_message=message,
+        validation_warning=warning,
+        validated=None,
+    )
+
+
+def _impossible(message: str, warning: Optional[str] = None) -> ValidationOutcome:
+    return ValidationOutcome(
+        status=ResponseStatus.IMPOSSIBLE_CONSTRAINT,
+        needs_clarification=True,
+        clarification_message=message,
+        validation_warning=warning,
+        validated=None,
+    )
+
+
+def _require_utc(value: datetime, field_name: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be timezone-aware UTC")
+    if value.utcoffset().total_seconds() != 0:
+        raise ValueError(f"{field_name} must be expressed in UTC")
+    return value.astimezone(UTC)
+
+
+def _format_utc(value: datetime) -> str:
+    return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _normalize_evidence(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return " ".join(normalized.split())
+
+
+def _first_full_half_hour_at_or_after(value: datetime) -> datetime:
+    utc_value = value.astimezone(UTC)
+    seconds = utc_value.timestamp()
+    rounded_seconds = math.ceil(seconds / HALF_HOUR_SECONDS) * HALF_HOUR_SECONDS
+    return datetime.fromtimestamp(rounded_seconds, tz=UTC)
+
+
+def _full_slots_available(start_utc: datetime, deadline_utc: datetime) -> int:
+    first_slot_start = _first_full_half_hour_at_or_after(start_utc)
+    seconds_available = (deadline_utc - first_slot_start).total_seconds()
+    if seconds_available <= 0:
+        return 0
+    return int(seconds_available // HALF_HOUR_SECONDS)
+
+
+def convert_local_to_utc(local_value: str) -> LocalTimeConversion:
+    """Resolve a Europe/London wall-clock deadline without silent DST repair.
+
+    Ambiguous autumn times use ``fold=0`` (the earlier occurrence) and carry a
+    visible warning. Nonexistent spring-forward times are rejected.
+    """
+
+    try:
+        naive = datetime.strptime(local_value, "%Y-%m-%dT%H:%M")
+    except ValueError as exc:
+        raise LocalTimeConversionError(
+            f"{local_value!r} is not a valid local datetime in YYYY-MM-DDTHH:MM format"
+        ) from exc
+
+    candidates: Dict[datetime, int] = {}
+    for fold in (0, 1):
+        aware = naive.replace(tzinfo=LONDON_TIMEZONE, fold=fold)
+        utc_value = aware.astimezone(UTC)
+        round_trip = utc_value.astimezone(LONDON_TIMEZONE)
+        if round_trip.replace(tzinfo=None) == naive:
+            candidates.setdefault(utc_value, fold)
+
+    if not candidates:
+        raise LocalTimeConversionError(
+            f"{local_value} does not exist in Europe/London because the clocks move forward"
+        )
+
+    if len(candidates) == 1:
+        utc_value, fold = next(iter(candidates.items()))
+        return LocalTimeConversion(
+            local_value=local_value,
+            utc_value=utc_value,
+            fold=fold,
+            is_ambiguous=False,
+        )
+
+    fold_zero = naive.replace(tzinfo=LONDON_TIMEZONE, fold=0).astimezone(UTC)
+    return LocalTimeConversion(
+        local_value=local_value,
+        utc_value=fold_zero,
+        fold=0,
+        is_ambiguous=True,
+        warning=(
+            f"{local_value} occurs twice in Europe/London; Tempo used the first "
+            "occurrence (fold=0) to preserve the earlier deadline."
+        ),
+    )
+
+
+def validate_gemini_output(
+    raw_text: str,
+    extraction: ScheduleExtractionSchema,
+    *,
+    start_time_utc: datetime,
+    forecast_horizon_end_utc: datetime,
+) -> ValidationOutcome:
+    """Validate Gemini's semantic extraction before price optimization.
+
+    The function never sorts, swaps, clamps, or otherwise repairs deadlines.
+    It returns a typed rejection when user clarification or a different physical
+    request is required.
+    """
+
+    start_utc = _require_utc(start_time_utc, "start_time_utc")
+    horizon_end_utc = _require_utc(
+        forecast_horizon_end_utc,
+        "forecast_horizon_end_utc",
+    )
+    if horizon_end_utc <= start_utc:
+        raise ValueError("forecast_horizon_end_utc must be after start_time_utc")
+
+    if extraction.needs_clarification:
+        missing = [
+            name
+            for name in (
+                "appliance",
+                "is_contiguous",
+                "earliest_local_deadline",
+                "expected_local_deadline",
+                "latest_local_deadline",
+                "evidence_quotes",
+            )
+            if getattr(extraction, name) is None
+        ]
+        if extraction.required_kwh is None and extraction.run_duration_hours is None:
+            missing.append("required_kwh or run_duration_hours")
+        detail = f" Missing: {', '.join(missing)}." if missing else ""
+        return _clarification(
+            "The schedule extraction needs clarification before Tempo can optimize it."
+            + detail
+        )
+
+    required_values = {
+        "appliance": extraction.appliance,
+        "is_contiguous": extraction.is_contiguous,
+        "earliest_local_deadline": extraction.earliest_local_deadline,
+        "expected_local_deadline": extraction.expected_local_deadline,
+        "latest_local_deadline": extraction.latest_local_deadline,
+        "evidence_quotes": extraction.evidence_quotes,
+    }
+    missing = [name for name, value in required_values.items() if value is None]
+    if missing:
+        return _clarification(
+            "The extracted schedule is incomplete. Please clarify: " + ", ".join(missing)
+        )
+
+    appliance_value = (
+        extraction.appliance.value
+        if isinstance(extraction.appliance, ApplianceType)
+        else str(extraction.appliance)
+    )
+    profile = APPLIANCE_PROFILES.get(appliance_value)
+    if profile is None:
+        return _clarification(
+            f"Tempo does not have a physical scheduling profile for {appliance_value!r}."
+        )
+
+    if profile.requires_contiguous and extraction.is_contiguous is not True:
+        return _clarification(
+            f"A {profile.label.lower()} cycle must run continuously. "
+            "Please confirm that the cycle may not be split across separate intervals."
+        )
+
+    prompt_normalized = _normalize_evidence(raw_text)
+    evidence = extraction.evidence_quotes
+    assert evidence is not None
+    for interpretation, quote in (
+        ("earliest", evidence.earliest),
+        ("expected", evidence.expected),
+        ("latest", evidence.latest),
+    ):
+        if _normalize_evidence(quote) not in prompt_normalized:
+            return _clarification(
+                f"The {interpretation} evidence quote was not found in the user's "
+                "schedule text. Please clarify the deadline."
+            )
+
+    deadline_text = {
+        "earliest": extraction.earliest_local_deadline,
+        "expected": extraction.expected_local_deadline,
+        "latest": extraction.latest_local_deadline,
+    }
+    conversions: Dict[str, LocalTimeConversion] = {}
+    for interpretation, local_value in deadline_text.items():
+        assert local_value is not None
+        try:
+            conversions[interpretation] = convert_local_to_utc(local_value)
+        except LocalTimeConversionError as exc:
+            return _clarification(
+                f"The {interpretation} deadline is not a usable Europe/London time: {exc}."
+            )
+
+    warnings = list(
+        dict.fromkeys(
+            conversion.warning
+            for conversion in conversions.values()
+            if conversion.warning is not None
+        )
+    )
+    validation_warning = " ".join(warnings) if warnings else None
+
+    earliest_utc = conversions["earliest"].utc_value
+    expected_utc = conversions["expected"].utc_value
+    latest_utc = conversions["latest"].utc_value
+
+    if earliest_utc <= start_utc:
+        return _clarification(
+            "The earliest deadline must be after the scheduling start time. "
+            f"Start is {_format_utc(start_utc)} and earliest is {_format_utc(earliest_utc)}.",
+            validation_warning,
+        )
+
+    if not (earliest_utc <= expected_utc <= latest_utc):
+        return _clarification(
+            "Extracted deadlines are chronologically contradictory. Please clarify "
+            "your earliest, expected, and latest availability. Tempo did not reorder them.",
+            validation_warning,
+        )
+
+    if latest_utc > horizon_end_utc:
+        return _impossible(
+            f"The latest deadline {_format_utc(latest_utc)} is outside the available "
+            f"forecast horizon ending {_format_utc(horizon_end_utc)}.",
+            validation_warning,
+        )
+
+    quiet_start: Optional[time] = None
+    quiet_end: Optional[time] = None
+    if extraction.quiet_hours_start is not None:
+        quiet_start = time.fromisoformat(extraction.quiet_hours_start)
+        quiet_end = time.fromisoformat(extraction.quiet_hours_end or "")
+        if quiet_start == quiet_end:
+            return _clarification(
+                "Quiet-hours start and end are identical. Please clarify whether this "
+                "means no quiet period or a full-day restriction.",
+                validation_warning,
+            )
+
+    if extraction.required_kwh is not None:
+        energy_kwh = float(extraction.required_kwh)
+        run_duration_hours = energy_kwh / profile.max_power_kw
+        required_slots = max(
+            1,
+            math.ceil((energy_kwh / (profile.max_power_kw * 0.5)) - 1e-12),
+        )
+    else:
+        assert extraction.run_duration_hours is not None
+        run_duration_hours = float(extraction.run_duration_hours)
+        energy_kwh = profile.max_power_kw * run_duration_hours
+        required_slots = max(1, math.ceil((run_duration_hours * 2.0) - 1e-12))
+
+    available_slots = _full_slots_available(start_utc, earliest_utc)
+    available_energy_kwh = available_slots * profile.max_power_kw * 0.5
+    if required_slots > available_slots:
+        if extraction.required_kwh is not None:
+            message = (
+                f"A {profile.max_power_kw:.1f} kW {profile.label.lower()} can supply at "
+                f"most {available_energy_kwh:.2f} kWh in {available_slots} full "
+                f"half-hour slot(s) before the earliest deadline, but "
+                f"{energy_kwh:.2f} kWh was requested."
+            )
+        else:
+            available_hours = available_slots * 0.5
+            message = (
+                f"Only {available_slots} full half-hour slot(s), or "
+                f"{available_hours:.2f} hours, fit before the earliest deadline, but "
+                f"the requested cycle lasts {run_duration_hours:.2f} hours and needs "
+                f"{required_slots} slot(s)."
+            )
+        return _impossible(message, validation_warning)
+
+    validated = ValidatedScheduleConstraints(
+        start_time_utc=start_utc,
+        forecast_horizon_end_utc=horizon_end_utc,
+        appliance=appliance_value,
+        appliance_label=profile.label,
+        max_power_kw=profile.max_power_kw,
+        energy_kwh=energy_kwh,
+        run_duration_hours=run_duration_hours,
+        required_slots=required_slots,
+        is_contiguous=bool(extraction.is_contiguous),
+        earliest_local_deadline=extraction.earliest_local_deadline,
+        expected_local_deadline=extraction.expected_local_deadline,
+        latest_local_deadline=extraction.latest_local_deadline,
+        earliest_utc=earliest_utc,
+        expected_utc=expected_utc,
+        latest_utc=latest_utc,
+        earliest_fold=conversions["earliest"].fold,
+        expected_fold=conversions["expected"].fold,
+        latest_fold=conversions["latest"].fold,
+        quiet_hours_start=quiet_start,
+        quiet_hours_end=quiet_end,
+        evidence_quotes=evidence,
+    )
+    return ValidationOutcome(
+        status=ResponseStatus.SUCCESS,
+        needs_clarification=False,
+        clarification_message=None,
+        validation_warning=validation_warning,
+        validated=validated,
+    )
 
 class GridScheduler:
     def __init__(self):
