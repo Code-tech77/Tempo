@@ -3,6 +3,7 @@ import Dashboard from './pages/Dashboard';
 import Schedule from './pages/Schedule';
 import Advisor from './pages/Advisor';
 import Settings from './pages/Settings';
+import SchedulePlanner from './pages/SchedulePlanner';
 import Footer from './components/Footer';
 // ── Shared household data ───────────────────────────────────────────
 export const HOUSEHOLDS = [
@@ -49,6 +50,7 @@ export const HOUSEHOLDS = [
 const NAV_ITEMS = [
   { id: 'dashboard', label: 'Dashboard', icon: '⚡' },
   { id: 'schedule',  label: 'Schedule',  icon: '📅' },
+  { id: 'plan',      label: 'Plan a run', icon: '⚡' },
   { id: 'advisor',   label: 'Advisor',   icon: '🎯' },
   { id: 'settings',  label: 'Settings',  icon: '⚙️'  },
 ];
@@ -87,6 +89,7 @@ export default function App() {
     switch (page) {
       case 'dashboard': return <Dashboard {...props} livePrice={livePrice} liveCarbon={liveCarbon} />;
       case 'schedule':  return <Schedule  {...props} />;
+      case 'plan':      return <SchedulePlanner />;
       case 'advisor':   return <Advisor   {...props} livePrice={livePrice} />;
       case 'settings':  return <Settings  {...props} />;
       default:          return <Dashboard {...props} livePrice={livePrice} liveCarbon={liveCarbon} />;
