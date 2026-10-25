@@ -76,11 +76,54 @@ export function createScheduleTransport(mode = import.meta.env?.VITE_TEMPO_TRANS
   throw new TypeError(`Unknown TEMPO transport mode: ${mode}`);
 }
 
-/** @returns {string} Convert a UTC slot to a readable local time without losing the UTC source. */
-export function formatSlot(slot) {
+const UK_TIME_ZONE = 'Europe/London';
+
+function slotDate(slot) {
   const normalized = slot.includes('T') ? slot : `2000-01-01T${slot.replace('Z', '')}:00Z`;
-  const date = new Date(normalized);
-  return `${new Intl.DateTimeFormat(undefined, { weekday: 'short', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' }).format(date)} (${slot} UTC)`;
+  return new Date(normalized);
+}
+
+function localDayKey(date) {
+  return new Intl.DateTimeFormat('en-CA', { year:'numeric', month:'2-digit', day:'2-digit', timeZone:UK_TIME_ZONE }).format(date);
+}
+
+function dateParts(date) {
+  return Object.fromEntries(new Intl.DateTimeFormat('en-GB', {
+    weekday:'short', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit',
+    hourCycle:'h23', timeZone:UK_TIME_ZONE, timeZoneName:'short',
+  }).formatToParts(date).map(part => [part.type, part.value]));
+}
+
+/** @returns {string} A compact Europe/London date and time for a UTC API value. */
+export function formatSlot(slot) {
+  const parts = dateParts(slotDate(slot));
+  return `${parts.weekday} ${parts.day} ${parts.month}, ${parts.hour}:${parts.minute} ${parts.timeZoneName}`;
+}
+
+/** @returns {string} A time-only Europe/London label for a UTC half-hour. */
+export function formatSlotTime(slot) {
+  return new Intl.DateTimeFormat('en-GB', {
+    hour:'2-digit', minute:'2-digit', hourCycle:'h23', timeZone:UK_TIME_ZONE,
+  }).format(slotDate(slot));
+}
+
+/** @returns {string} The readable UK timezone abbreviation for a UTC value. */
+export function formatSlotZone(slot) {
+  return dateParts(slotDate(slot)).timeZoneName;
+}
+
+/** @returns {string} One readable local range when slots are continuous. */
+export function formatScheduleRange(slots) {
+  if (!Array.isArray(slots) || slots.length === 0) return 'No time available';
+  const dates = slots.map(slotDate);
+  const continuous = dates.every((date, index) => index === 0 || date.getTime() - dates[index - 1].getTime() === 30 * 60 * 1000);
+  const sameDay = dates.every(date => localDayKey(date) === localDayKey(dates[0]));
+  const sameZone = slots.every(slot => formatSlotZone(slot) === formatSlotZone(slots[0]));
+  if (!continuous || !sameDay || !sameZone) return slots.map(formatSlot).join(' · ');
+  const day = new Intl.DateTimeFormat('en-GB', { weekday:'short', day:'numeric', month:'short', timeZone:UK_TIME_ZONE }).format(dates[0]).replace(',', '');
+  const end = new Date(dates.at(-1).getTime() + 30 * 60 * 1000);
+  const endTime = new Intl.DateTimeFormat('en-GB', { hour:'2-digit', minute:'2-digit', hourCycle:'h23', timeZone:UK_TIME_ZONE }).format(end);
+  return `${day}, ${formatSlotTime(slots[0])}–${endTime} ${formatSlotZone(slots[0])}`;
 }
 
 export function getResponseMessage(response) {

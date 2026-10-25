@@ -4,6 +4,7 @@ import Schedule from './pages/Schedule';
 import Advisor from './pages/Advisor';
 import Settings from './pages/Settings';
 import SchedulePlanner from './pages/SchedulePlanner';
+import { upsertAppliance } from './scheduling/advisorSchedule.js';
 
 export const HOUSEHOLDS = [
   {
@@ -45,13 +46,34 @@ const NAV_ITEMS = [
   { id: 'settings', label: 'Settings' },
 ];
 
+const HOUSEHOLD_STORAGE_KEY = 'tempo.households.v1';
+
+function loadHouseholds() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(HOUSEHOLD_STORAGE_KEY));
+    if (!Array.isArray(saved)) return HOUSEHOLDS;
+    return HOUSEHOLDS.map(household => {
+      const stored = saved.find(item => item?.id === household.id);
+      return stored && Array.isArray(stored.appliances) ? { ...household, appliances:stored.appliances } : household;
+    });
+  } catch {
+    return HOUSEHOLDS;
+  }
+}
+
 export default function App() {
   const [page, setPage] = useState('dashboard');
   const [householdId, setHouseholdId] = useState('h1');
+  const [households, setHouseholds] = useState(loadHouseholds);
+  const [scheduleNotice, setScheduleNotice] = useState('');
   const [livePrice, setLivePrice] = useState(16.4);
   const [liveCarbon, setLiveCarbon] = useState(128);
   const [plannerDraft, setPlannerDraft] = useState('');
-  const household = HOUSEHOLDS.find(item => item.id === householdId);
+  const household = households.find(item => item.id === householdId);
+
+  useEffect(() => {
+    localStorage.setItem(HOUSEHOLD_STORAGE_KEY, JSON.stringify(households));
+  }, [households]);
 
   useEffect(() => {
     fetch('/api/status')
@@ -69,11 +91,19 @@ export default function App() {
     setPage('plan');
   };
 
+  const addAdvisorSchedule = entry => {
+    setHouseholds(current => current.map(item => item.id === householdId
+      ? { ...item, appliances:upsertAppliance(item.appliances, entry) }
+      : item));
+    setScheduleNotice(`${entry.name} was added to the household schedule.`);
+    setPage('schedule');
+  };
+
   const shared = { household, householdId, setHouseholdId };
   const renderPage = () => {
     if (page === 'dashboard') return <Dashboard {...shared} livePrice={livePrice} liveCarbon={liveCarbon} plannerDraft={plannerDraft} setPlannerDraft={setPlannerDraft} onOpenPlanner={openPlanner} />;
-    if (page === 'schedule') return <Schedule {...shared} />;
-    if (page === 'advisor') return <Advisor {...shared} livePrice={livePrice} liveCarbon={liveCarbon} />;
+    if (page === 'schedule') return <Schedule {...shared} notice={scheduleNotice} />;
+    if (page === 'advisor') return <Advisor {...shared} livePrice={livePrice} liveCarbon={liveCarbon} onAddToSchedule={addAdvisorSchedule} />;
     if (page === 'settings') return <Settings {...shared} />;
     if (page === 'plan') return <SchedulePlanner initialPrompt={plannerDraft} onPromptChange={setPlannerDraft} onBack={() => setPage('dashboard')} />;
     return null;
@@ -84,11 +114,11 @@ export default function App() {
       <header className="topbar">
         <button className="wordmark" onClick={() => setPage('dashboard')} aria-label="Tempo dashboard">Tempo</button>
         <nav className="nav-segments" aria-label="Main navigation">
-          {NAV_ITEMS.map(item => <button key={item.id} className={page === item.id ? 'active' : ''} onClick={() => setPage(item.id)}>{item.label}</button>)}
+          {NAV_ITEMS.map(item => <button key={item.id} className={page === item.id ? 'active' : ''} onClick={() => { setScheduleNotice(''); setPage(item.id); }}>{item.label}</button>)}
         </nav>
         <label className="household-select">
           <span className="sr-only">Demo household</span>
-          <select value={householdId} onChange={event => setHouseholdId(event.target.value)} aria-label="Demo household">
+          <select value={householdId} onChange={event => { setScheduleNotice(''); setHouseholdId(event.target.value); }} aria-label="Demo household">
             {HOUSEHOLDS.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
           </select>
         </label>

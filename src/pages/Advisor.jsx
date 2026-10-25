@@ -3,6 +3,7 @@ import ForecastRadar from '../components/ForecastRadar.jsx';
 import GridStaggerSimulator from '../components/GridStaggerSimulator.jsx';
 import HistoricalBacktest from '../components/HistoricalBacktest.jsx';
 import Reveal from '../components/Reveal.jsx';
+import { createAdvisorScheduleEntry } from '../scheduling/advisorSchedule.js';
 import { formatMoney } from '../scheduling/money.js';
 
 const PRESETS = [
@@ -14,7 +15,7 @@ const PRESETS = [
   { id:'dishwasher', name:'Dishwasher', kw:1.8, hrs:2 },
 ];
 
-export default function Advisor({ household, livePrice, liveCarbon }) {
+export default function Advisor({ household, livePrice, liveCarbon, onAddToSchedule = () => {} }) {
   const [preset, setPreset] = useState('ev');
   const [kw, setKw] = useState(7);
   const [hrs, setHrs] = useState(3.5);
@@ -61,6 +62,11 @@ export default function Advisor({ household, livePrice, liveCarbon }) {
   const savedToday = household.appliances.reduce((sum, item) => sum + item.saving, 0);
   const carbonSaved = household.appliances.reduce((sum, item) => sum + item.carbon, 0);
   const carbonWord = liveCarbon < 100 ? 'Low' : liveCarbon < 200 ? 'Medium' : 'High';
+  const addToSchedule = () => {
+    const entry = createAdvisorScheduleEntry({ preset:selected, powerKw:kw, durationHours:hrs, result });
+    onAddToSchedule(entry);
+    setScheduled(true);
+  };
 
   return (
     <div className="advisor-page">
@@ -104,7 +110,7 @@ export default function Advisor({ household, livePrice, liveCarbon }) {
                 <div><dt>Run now</dt><dd>{result.cost_now_pounds}</dd></div>
                 <div><dt>Recommended time</dt><dd>{result.cost_scheduled_pounds}</dd></div>
               </dl>
-              <button className="primary-button" onClick={() => setScheduled(true)} disabled={scheduled}>{scheduled ? 'Added to schedule' : 'Add to schedule'}</button>
+              <button className="primary-button" onClick={addToSchedule} disabled={scheduled}>{scheduled ? 'Added to schedule' : 'Add to schedule'}</button>
             </div>
           )}
         </section>

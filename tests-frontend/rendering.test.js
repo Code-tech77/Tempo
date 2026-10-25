@@ -30,7 +30,9 @@ test('successful schedule rendering shows recommendation, savings and all three 
   assert.match(markup, /Later deadline/);
   assert.match(markup, /£1\.26 flexibility spread/);
   assert.match(markup, /Credit: £0\.12/);
-  assert.match(markup, /2026-10-25T02:00Z UTC/);
+  assert.match(markup, /Sun 25 Oct, 02:00–03:30 GMT/);
+  assert.match(markup, />02:00<\/time>/);
+  assert.doesNotMatch(markup, />2026-10-25T02:00Z UTC</);
 });
 
 test('old responses derive the baseline and keep negative savings signed', () => {

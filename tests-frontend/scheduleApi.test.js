@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildScheduleRequest, createScheduleTransport, formatSlot, getResponseMessage } from '../src/scheduling/scheduleApi.js';
+import { buildScheduleRequest, createScheduleTransport, formatScheduleRange, formatSlot, formatSlotTime, getResponseMessage } from '../src/scheduling/scheduleApi.js';
 import { clarificationFixture, impossibleFixture, successFixture } from '../src/scheduling/scheduleFixtures.js';
 import { formatMoney, getBaselineCost } from '../src/scheduling/money.js';
 
@@ -88,8 +88,9 @@ test('network and server failures are surfaced without falling back to mocks', a
   await assert.rejects(createScheduleTransport('mock', 'server_error').submit({}), /temporarily unavailable/);
 });
 
-test('UTC half-hour recommendation slots are presented with local time and UTC source', () => {
-  const display = formatSlot('2026-10-25T02:00Z');
-  assert.match(display, /2026-10-25T02:00Z UTC/);
+test('UTC half-hours are presented as compact UK-local times', () => {
+  assert.equal(formatSlot('2026-10-26T03:00Z'), 'Mon 26 Oct, 03:00 GMT');
+  assert.equal(formatSlotTime('2026-10-26T03:30Z'), '03:30');
+  assert.equal(formatScheduleRange(['2026-10-26T03:00Z', '2026-10-26T03:30Z', '2026-10-26T04:00Z']), 'Mon 26 Oct, 03:00–04:30 GMT');
   assert.throws(() => createScheduleTransport('fallback'), /Unknown TEMPO transport/);
 });

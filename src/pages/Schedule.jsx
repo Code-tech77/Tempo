@@ -8,7 +8,7 @@ const parseHour = value => {
 const STATUS_LABEL = { running:'Running now', scheduled:'Scheduled', waiting:'Waiting', done:'Complete' };
 const HOUR_MARKS = [0, 6, 12, 18, 24];
 
-export default function Schedule({ household }) {
+export default function Schedule({ household, notice = '' }) {
   const now = new Date();
   const nowHour = now.getHours() + now.getMinutes() / 60;
   const appliances = household.appliances;
@@ -22,6 +22,8 @@ export default function Schedule({ household }) {
         <h1 className="page-title">Today, at a glance</h1>
         <p className="page-sub">{household.name} · {now.toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long' })}</p>
       </Reveal>
+
+      {notice && <p className="schedule-confirmation" role="status">{notice}</p>}
 
       <Reveal as="dl" className="metric-grid">
         <div className="metric"><dt className="metric-label">Appliances today</dt><dd className="metric-value">{appliances.length}</dd><small className="metric-note">Across this household</small></div>

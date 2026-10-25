@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { AlertCircle, ArrowLeft, ArrowRight, Check, Clock3, Leaf, LoaderCircle, RotateCcw, Shield, Sparkles, Zap } from 'lucide-react';
-import { buildScheduleRequest, createScheduleTransport, EXAMPLES, formatSlot, getResponseMessage } from '../scheduling/scheduleApi.js';
+import { buildScheduleRequest, createScheduleTransport, EXAMPLES, formatScheduleRange, formatSlot, formatSlotTime, formatSlotZone, getResponseMessage } from '../scheduling/scheduleApi.js';
 import { formatMoney, getBaselineCost } from '../scheduling/money.js';
 import './SchedulePlanner.css';
 
@@ -15,10 +15,13 @@ const SCENARIOS = [
 ];
 function ScenarioCard({ scenario, recommended }) {
   const baselineCost = getBaselineCost(scenario);
+  const slotDays = new Set(scenario.recommended_slots_utc.map(slot => formatSlot(slot).split(',')[0]));
+  const slotZones = new Set(scenario.recommended_slots_utc.map(formatSlotZone));
+  const compactSlots = slotDays.size === 1 && slotZones.size === 1;
   return (
     <article className={`planner-scenario ${recommended ? 'is-recommended' : ''}`}>
       <div className="planner-scenario-head">
-        <div><h3>{scenario.label}</h3><p>Finish by {scenario.deadline_local}</p></div>
+        <div><h3>{scenario.label}</h3><p>Finish by <time dateTime={scenario.deadline_utc} title={`UTC source: ${scenario.deadline_utc}`}>{formatSlot(scenario.deadline_utc)}</time></p></div>
         {recommended && <span className="planner-recommended"><Check size={13} /> Recommended</span>}
       </div>
       <div className="planner-scenario-price">
@@ -33,11 +36,11 @@ function ScenarioCard({ scenario, recommended }) {
         <div><dt>Chance waiting costs less</dt><dd>{scenario.wait_probability_pct}%</dd></div>
         <div><dt>Worst case loss</dt><dd>{formatMoney(scenario.worst_case_loss_pence / 100)}</dd></div>
         <div><dt>Carbon impact</dt><dd>{Math.round(scenario.carbon_g_co2).toLocaleString()} g CO₂</dd></div>
-        <div><dt>Deadline</dt><dd>{scenario.deadline_local}</dd></div>
+        <div><dt>Deadline</dt><dd><time dateTime={scenario.deadline_utc} title={`UTC source: ${scenario.deadline_utc}`}>{formatSlot(scenario.deadline_utc)}</time></dd></div>
       </dl>
       <div className="planner-slots">
-        <h4>Recommended times <span>shown locally, with the source UTC time</span></h4>
-        <ul>{scenario.recommended_slots_utc.map(slot => <li key={slot}><Clock3 size={14} /><span>{formatSlot(slot)}</span></li>)}</ul>
+        <h4>Recommended half-hours <span>{compactSlots ? `${formatSlot(scenario.recommended_slots_utc[0]).split(',')[0]} · ${formatSlotZone(scenario.recommended_slots_utc[0])}` : 'UK time'}</span></h4>
+        <ul>{scenario.recommended_slots_utc.map(slot => <li key={slot}><Clock3 size={14} /><time dateTime={slot} title={`UTC source: ${slot}`}>{compactSlots ? formatSlotTime(slot) : formatSlot(slot)}</time></li>)}</ul>
       </div>
     </article>
   );
@@ -52,7 +55,7 @@ export function Results({ response }) {
       {response.validation_warning && <div className="planner-notice warning" role="status"><AlertCircle size={18} /><p>{response.validation_warning}</p></div>}
       <div className="planner-result-hero">
         <div className="planner-result-icon"><Zap size={20} /></div>
-        <div><p className="planner-eyebrow">Recommended schedule · expected timing</p><h2 id="planner-results-title">{recommended.recommended_slots_utc.map(slot => formatSlot(slot)).join(' · ')}</h2></div>
+        <div><p className="planner-eyebrow">Recommended schedule · expected timing</p><h2 id="planner-results-title" title={`UTC slots: ${recommended.recommended_slots_utc.join(', ')}`}>{formatScheduleRange(recommended.recommended_slots_utc)}</h2></div>
         <dl className="planner-result-cost">
           <div><dt>Scheduled cost</dt><dd>{formatMoney(recommended.estimated_cost_gbp, { negativeAsCredit: true })}</dd></div>
           <div><dt>Running-now baseline</dt><dd>{formatMoney(recommendedBaseline, { negativeAsCredit: true })}</dd></div>
@@ -126,7 +129,7 @@ export default function SchedulePlanner({ initialPrompt = '', onPromptChange = (
             <div className="planner-setting-row risk-row"><div><label htmlFor="risk-appetite">How much certainty do you want?</label><p>Choose how cautious Tempo should be about changing prices</p></div>
               <select id="risk-appetite" value={riskAppetite} onChange={event => setRiskAppetite(event.target.value)}><option value="safe">Play it safe</option><option value="balanced">Balanced</option><option value="aggressive">Chase bigger savings</option></select></div>
           </div>
-          <div className="planner-current-time"><Clock3 size={15} /><span>Current time supplied automatically</span><time dateTime={currentTime}>{new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC' }).format(new Date(currentTime))} UTC</time></div>
+          <div className="planner-current-time"><Clock3 size={15} /><span>Current time supplied automatically</span><time dateTime={currentTime}>{new Intl.DateTimeFormat('en-GB', { dateStyle:'medium', timeStyle:'short', timeZone:'Europe/London' }).format(new Date(currentTime))} UK time</time></div>
           {error && <div className="planner-notice error" role="alert"><AlertCircle size={18} /><p>{error}</p></div>}
           <button className="planner-submit" type="submit" disabled={loading}>{loading ? <><LoaderCircle className="planner-spin" size={18} /> Interpreting your schedule and finding suitable energy slots…</> : <>Find a suitable time <ArrowRight size={17} /></>}</button>
           {error && <button className="planner-retry" type="button" onClick={() => document.querySelector('.planner-form')?.requestSubmit()}><RotateCcw size={14} /> Try again</button>}
