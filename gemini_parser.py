@@ -79,6 +79,9 @@ Rules:
   duration, or a recognizable completion time is missing or contradictory in a
   way that prevents a faithful extraction. Leave unsupported optional values
   null rather than guessing.
+- The supported appliances are ev_charger, dishwasher, and washing_machine. If
+  the user only describes another appliance or their general day, leave the
+  unsupported fields null and set needs_clarification to true.
 """.strip()
 
 
@@ -211,9 +214,13 @@ class GeminiScheduleParser:
                 response_text = "\n".join(lines[1:-1]).strip()
             return ScheduleExtractionSchema.model_validate_json(response_text)
         except (ValidationError, ValueError, TypeError) as exc:
-            raise ParserOutputError(
-                "Gemini returned data that did not match ScheduleExtractionSchema"
-            ) from exc
+            # The JSON schema constrains individual fields, while Pydantic also
+            # enforces relationships between fields (for example, exactly one
+            # of energy or duration for a complete extraction). If Gemini
+            # violates one of those relationships, fail closed to a typed
+            # clarification response. No model-provided values are trusted or
+            # repaired, and deterministic validation decides what to ask next.
+            return ScheduleExtractionSchema(needs_clarification=True)
 
     def parse(
         self,
@@ -222,14 +229,15 @@ class GeminiScheduleParser:
     ) -> ScheduleExtractionSchema:
         contents = (
             build_schedule_prompt(user_prompt, current_time_iso)
-            + "\n\nReturn exactly one JSON object matching this schema:\n"
-            + json.dumps(GEMINI_RESPONSE_SCHEMA, ensure_ascii=False, separators=(",", ":"))
+            + "\n\nReturn exactly one JSON object matching the configured response schema."
         )
         client = self._get_client()
 
         config = {
             "system_instruction": SYSTEM_INSTRUCTION,
             "temperature": 0.0,
+            "response_mime_type": "application/json",
+            "response_json_schema": GEMINI_RESPONSE_SCHEMA,
         }
 
         last_error: Optional[Exception] = None

@@ -90,9 +90,9 @@ def test_valid_structured_extraction_and_sdk_configuration():
     call = client.models.calls[0]
     assert call["model"] == "gemini-3.5-flash"
     assert call["config"]["temperature"] == 0.0
-    assert "response_mime_type" not in call["config"]
-    assert "response_schema" not in call["config"]
-    assert '"needs_clarification"' in call["contents"]
+    assert call["config"]["response_mime_type"] == "application/json"
+    assert call["config"]["response_json_schema"] == GEMINI_RESPONSE_SCHEMA
+    assert "configured response schema" in call["contents"]
     assert "exclusiveMinimum" not in json.dumps(GEMINI_RESPONSE_SCHEMA)
     assert "additionalProperties" not in json.dumps(GEMINI_RESPONSE_SCHEMA)
 
@@ -161,11 +161,23 @@ def test_contradictory_deadlines_are_preserved_for_stage_c_to_reject():
         FakeResponse(text="not-json"),
         FakeResponse(payload={**valid_extraction(), "unexpected": True}),
         FakeResponse(payload=valid_extraction(required_kwh=None)),
-        FakeResponse(payload=None, text=None),
     ],
 )
-def test_invalid_model_output_is_rejected_without_retry(response):
+def test_invalid_model_output_fails_closed_to_clarification_without_retry(response):
     parser, client = make_parser(response, RuntimeError("must not retry"), max_attempts=2)
+
+    result = parser.parse("Charge 14 kWh by 7am.", REFERENCE_TIME)
+
+    assert result == ScheduleExtractionSchema(needs_clarification=True)
+    assert len(client.models.calls) == 1
+
+
+def test_missing_model_output_is_rejected_without_retry():
+    parser, client = make_parser(
+        FakeResponse(payload=None, text=None),
+        RuntimeError("must not retry"),
+        max_attempts=2,
+    )
 
     with pytest.raises(ParserOutputError):
         parser.parse("Charge 14 kWh by 7am.", REFERENCE_TIME)
