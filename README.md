@@ -270,6 +270,36 @@ npm run build
 
 This writes the optimised site to `dist/`.
 
+### Stage E schedule planner
+
+The **Plan a run** page collects an appliance schedule and sends the locked
+`ParseAndScheduleRequest` shape to `POST /api/parse-and-schedule`. The request
+uses the current UTC time, carbon weight, and risk appetite. The Stage C
+scheduling endpoint is still under development; the existing
+`/api/parse-constraints` route is an extraction-only Stage B endpoint and is
+not used as a fallback.
+
+By default the planner uses the real API. To deliberately preview representative
+states, add these values to a root `.env` file and restart Vite:
+
+```env
+VITE_TEMPO_TRANSPORT=mock
+VITE_TEMPO_MOCK_STATE=success
+```
+
+Set `VITE_TEMPO_MOCK_STATE` to `success`, `clarification`, `impossible`,
+`network_error`, or `server_error` to inspect each state. The two error modes
+exercise retry handling; they do not call the real API. Mock mode is visibly
+labelled as cached demo data in the planner. To use a separately
+hosted backend, set `VITE_TEMPO_API_URL` to its base URL; the client then posts
+to `/api/parse-and-schedule`. For the local backend, Vite already proxies `/api`
+to `http://127.0.0.1:8000`.
+
+The planner consumes the Stage D `baseline_cost_gbp` scenario field. During the
+parallel backend rollout it remains compatible with older responses by deriving
+that baseline as `estimated_cost_gbp + savings_vs_now_gbp` only when the explicit
+field is absent. Negative scheduled costs are displayed as electricity credits.
+
 ### Step 6 (optional): Add the Kaggle datasets
 
 1. Create a Kaggle API token in your Kaggle account settings and place `kaggle.json` in `~/.kaggle/` (Windows: `C:\Users\<you>\.kaggle\`).
