@@ -17,7 +17,15 @@ import uvicorn
 
 from data_service import DataService
 from forecast_engine import ForecastEngine
-from scheduler import GridScheduler
+from scheduler import (
+    ForecastDataError,
+    GridScheduler,
+    ScheduleOptimizationError,
+    SolverOptimalityError,
+    normalize_forecast_slots,
+    run_multi_scenario_schedule,
+    validate_gemini_output,
+)
 from backtest_engine import BacktestEngine
 from gemini_parser import (
     GeminiScheduleParser,
@@ -27,7 +35,12 @@ from gemini_parser import (
     ParserUnavailableError,
     ScheduleParser,
 )
-from schemas import ParseAndScheduleRequest, ScheduleExtractionSchema
+from schemas import (
+    ParseAndScheduleRequest,
+    ParseAndScheduleResponse,
+    ResponseStatus,
+    ScheduleExtractionSchema,
+)
 
 # Initialize Core Services
 data_service = DataService()
@@ -123,7 +136,12 @@ def get_forecast():
     """Returns 24-48h half-hourly forecast with p10/p50/p90 quantile regression."""
     agile_rates = data_service.fetch_octopus_agile_rates()
     weather = data_service.fetch_oxford_weather()
-    forecast_slots = forecast_engine.forecast_horizons(agile_rates, weather)
+    carbon = data_service.fetch_uk_carbon_intensity()
+    forecast_slots = forecast_engine.forecast_horizons(
+        agile_rates,
+        weather,
+        carbon,
+    )
     
     return {
         "slots_count": len(forecast_slots),
@@ -165,6 +183,108 @@ def parse_schedule_constraints(
             detail="Gemini returned an invalid structured schedule",
         ) from exc
 
+
+@app.post(
+    "/api/parse-and-schedule",
+    response_model=ParseAndScheduleResponse,
+    tags=["Schedule interpretation"],
+    summary="Interpret a household schedule and optimize three deadline scenarios",
+)
+def parse_and_schedule(
+    payload: ParseAndScheduleRequest,
+    parser: ScheduleParser = Depends(get_schedule_parser),
+):
+    """Run Gemini extraction, deterministic validation, and price optimization."""
+
+    try:
+        extraction = parser.parse(payload.user_prompt, payload.current_time_iso)
+    except ParserInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ParserConfigurationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ParserUnavailableError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini schedule parsing is temporarily unavailable",
+        ) from exc
+    except ParserOutputError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="Gemini returned an invalid structured schedule",
+        ) from exc
+
+    try:
+        agile_rates = data_service.fetch_octopus_agile_rates()
+        weather = data_service.fetch_oxford_weather()
+        carbon = data_service.fetch_uk_carbon_intensity()
+        forecast = forecast_engine.forecast_horizons(
+            agile_rates,
+            weather,
+            carbon,
+            horizon_start_utc=payload.current_time_iso,
+        )
+        normalized_slots = normalize_forecast_slots(
+            forecast,
+            start_time_utc=payload.current_time_iso,
+        )
+    except ForecastDataError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"A usable half-hour forecast is unavailable: {exc}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="The price forecast is temporarily unavailable",
+        ) from exc
+
+    validation = validate_gemini_output(
+        payload.user_prompt,
+        extraction,
+        start_time_utc=payload.current_time_iso,
+        forecast_horizon_end_utc=normalized_slots[-1].end_utc,
+    )
+    if not validation.is_valid:
+        return ParseAndScheduleResponse(
+            status=validation.status,
+            needs_clarification=True,
+            clarification_message=validation.clarification_message,
+            validation_warning=validation.validation_warning,
+            parsed_constraints=None,
+            scenarios=None,
+            flexibility_spread_pence=None,
+        )
+
+    assert validation.validated is not None
+    try:
+        return run_multi_scenario_schedule(
+            validation.validated,
+            normalized_slots,
+            carbon_weight=payload.carbon_weight,
+            risk_appetite=payload.risk_appetite,
+            validation_warning=validation.validation_warning,
+        )
+    except SolverOptimalityError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="The optimizer could not prove an optimal household schedule",
+        ) from exc
+    except ForecastDataError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"A usable half-hour forecast is unavailable: {exc}",
+        ) from exc
+    except ScheduleOptimizationError as exc:
+        return ParseAndScheduleResponse(
+            status=ResponseStatus.IMPOSSIBLE_CONSTRAINT,
+            needs_clarification=True,
+            clarification_message=str(exc),
+            validation_warning=validation.validation_warning,
+            parsed_constraints=None,
+            scenarios=None,
+            flexibility_spread_pence=None,
+        )
+
 @app.post("/api/recommend")
 def get_appliance_recommendation(payload: RecommendationRequest):
     """
@@ -173,7 +293,12 @@ def get_appliance_recommendation(payload: RecommendationRequest):
     """
     agile_rates = data_service.fetch_octopus_agile_rates()
     weather = data_service.fetch_oxford_weather()
-    forecast_slots = forecast_engine.forecast_horizons(agile_rates, weather)
+    carbon = data_service.fetch_uk_carbon_intensity()
+    forecast_slots = forecast_engine.forecast_horizons(
+        agile_rates,
+        weather,
+        carbon,
+    )
 
     rec = forecast_engine.evaluate_recommendation(
         appliance_name=payload.appliance,

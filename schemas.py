@@ -8,6 +8,7 @@ without coordinating the backend, validator, and frontend at the same time.
 
 from datetime import datetime
 from enum import Enum
+import math
 import re
 from typing import Dict, List, Literal, Optional
 
@@ -163,12 +164,14 @@ class ScenarioResult(LockedModel):
     label: str = Field(..., min_length=1, max_length=150)
     deadline_local: str = Field(..., min_length=1, max_length=100)
     deadline_utc: datetime
-    estimated_cost_gbp: float = Field(..., ge=0.0)
+    estimated_cost_gbp: float
+    baseline_cost_gbp: float
     savings_vs_now_gbp: float
     wait_probability_pct: float = Field(..., ge=0.0, le=100.0)
     worst_case_loss_pence: float = Field(..., ge=0.0)
     carbon_g_co2: float = Field(..., ge=0.0)
     recommended_slots_utc: List[str] = Field(..., min_length=1, max_length=96)
+    recommended_slot_energy_kwh: List[float] = Field(..., min_length=1, max_length=96)
 
     @field_validator("deadline_utc")
     @classmethod
@@ -189,6 +192,21 @@ class ScenarioResult(LockedModel):
                 "HH:30Z, or an ISO date followed by one of those times"
             )
         return values
+
+    @field_validator("recommended_slot_energy_kwh")
+    @classmethod
+    def validate_slot_energy(cls, values: List[float]) -> List[float]:
+        if any(not math.isfinite(value) or value <= 0.0 for value in values):
+            raise ValueError("recommended slot energy values must be positive and finite")
+        return values
+
+    @model_validator(mode="after")
+    def validate_slot_allocation_lengths(self):
+        if len(self.recommended_slots_utc) != len(self.recommended_slot_energy_kwh):
+            raise ValueError(
+                "recommended slot times and energy allocations must have equal lengths"
+            )
+        return self
 
 
 class ScenarioComparison(LockedModel):

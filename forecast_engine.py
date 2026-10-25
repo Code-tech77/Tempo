@@ -10,10 +10,142 @@ Tempo Forecasting & Monte Carlo Simulation Engine
 """
 
 import math
+from datetime import datetime, timedelta, timezone
 import numpy as np
-import pandas as pd
-from typing import Dict, List, Any, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from sklearn.ensemble import GradientBoostingRegressor
+
+
+UTC = timezone.utc
+
+
+def _parse_utc_timestamp(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def _carbon_by_start(
+    carbon_data: Optional[List[Dict[str, Any]]],
+) -> Dict[datetime, Tuple[float, str]]:
+    values: Dict[datetime, Tuple[float, str]] = {}
+    for item in carbon_data or []:
+        start = _parse_utc_timestamp(item.get("from"))
+        intensity = item.get("intensity", {})
+        if start is None or not isinstance(intensity, dict):
+            continue
+        raw_value = intensity.get("actual")
+        if raw_value is None:
+            raw_value = intensity.get("forecast")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value) or value < 0:
+            continue
+        values[start] = (value, str(item.get("_tempo_source", "unspecified")))
+    return values
+
+
+def _floor_half_hour(value: datetime) -> datetime:
+    utc_value = value.astimezone(UTC)
+    return utc_value.replace(
+        minute=0 if utc_value.minute < 30 else 30,
+        second=0,
+        microsecond=0,
+    )
+
+
+def _prepare_tariff_horizon(
+    slots_data: List[Dict[str, Any]],
+    *,
+    horizon_start_utc: datetime,
+    horizon_slots: int,
+) -> List[Dict[str, Any]]:
+    published_by_start: Dict[datetime, Dict[str, Any]] = {}
+    for slot in slots_data:
+        start = _parse_utc_timestamp(slot.get("valid_from"))
+        end = _parse_utc_timestamp(slot.get("valid_to"))
+        if start is None or end is None or end - start != timedelta(minutes=30):
+            continue
+        published_by_start[start] = slot
+
+    start = _floor_half_hour(horizon_start_utc)
+    prepared: List[Dict[str, Any]] = []
+    for index in range(horizon_slots):
+        slot_start = start + timedelta(minutes=30 * index)
+        slot_end = slot_start + timedelta(minutes=30)
+        published = published_by_start.get(slot_start)
+        if published is not None:
+            prepared.append(published)
+        else:
+            prepared.append(
+                {
+                    "valid_from": slot_start.isoformat().replace("+00:00", "Z"),
+                    "valid_to": slot_end.isoformat().replace("+00:00", "Z"),
+                    "_tempo_source": "quantile_model_forecast",
+                }
+            )
+    return prepared
+
+
+def evaluate_selected_schedule_risk(
+    selected_allocations: List[Dict[str, float]],
+    *,
+    baseline_cost_pence: float,
+    random_seed: int,
+    simulations: int = 1000,
+) -> Tuple[float, float]:
+    """Evaluate the exact selected schedule against a fixed run-now baseline.
+
+    Slot uncertainty is inferred from its p10/p50/p90 forecast. A shared shock
+    models correlation across adjacent electricity-price slots, while an
+    idiosyncratic component preserves slot-specific uncertainty.
+    """
+
+    if simulations < 100:
+        raise ValueError("simulations must be at least 100")
+    if not selected_allocations:
+        raise ValueError("selected_allocations cannot be empty")
+
+    rng = np.random.default_rng(random_seed)
+    shared_shock = rng.normal(size=simulations)
+    simulated_costs = np.zeros(simulations, dtype=float)
+    correlation = 0.65
+    independent_weight = math.sqrt(1.0 - correlation**2)
+    quantile_z = 1.2815515655446004
+
+    for allocation in selected_allocations:
+        p10 = float(allocation["p10"])
+        p50 = float(allocation["p50"])
+        p90 = float(allocation["p90"])
+        energy_kwh = float(allocation["energy_kwh"])
+        if not p10 <= p50 <= p90 or energy_kwh <= 0:
+            raise ValueError("risk allocations require ordered quantiles and positive energy")
+
+        independent_shock = rng.normal(size=simulations)
+        combined_shock = (
+            correlation * shared_shock + independent_weight * independent_shock
+        )
+        lower_sigma = max(0.0, (p50 - p10) / quantile_z)
+        upper_sigma = max(0.0, (p90 - p50) / quantile_z)
+        sigmas = np.where(combined_shock < 0, lower_sigma, upper_sigma)
+        sampled_rates = p50 + combined_shock * sigmas
+        simulated_costs += sampled_rates * energy_kwh
+
+    wait_probability = float(np.mean(simulated_costs < baseline_cost_pence)) * 100.0
+    losses = np.maximum(0.0, simulated_costs - baseline_cost_pence)
+    worst_case_loss = float(np.percentile(losses, 95))
+    return round(wait_probability, 1), round(worst_case_loss, 1)
 
 class ForecastEngine:
     def __init__(self):
@@ -62,21 +194,43 @@ class ForecastEngine:
         self.p50_model.fit(X, y)
         self.p90_model.fit(X, y)
 
-    def forecast_horizons(self, slots_data: List[Dict[str, Any]], weather_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def forecast_horizons(
+        self,
+        slots_data: List[Dict[str, Any]],
+        weather_data: Dict[str, Any],
+        carbon_data: Optional[List[Dict[str, Any]]] = None,
+        horizon_start_utc: Optional[datetime] = None,
+        horizon_slots: int = 96,
+    ) -> List[Dict[str, Any]]:
         """
         Enhances half-hourly slots with p10, p50, and p90 quantile predictions
         and carbon projections.
         """
+        if horizon_slots < 1 or horizon_slots > 192:
+            raise ValueError("horizon_slots must be between 1 and 192")
+        start_utc = horizon_start_utc or datetime.now(UTC)
+        if start_utc.tzinfo is None or start_utc.utcoffset() is None:
+            raise ValueError("horizon_start_utc must be timezone-aware")
+        slots_data = _prepare_tariff_horizon(
+            slots_data,
+            horizon_start_utc=start_utc.astimezone(UTC),
+            horizon_slots=horizon_slots,
+        )
         results = []
         winds = weather_data.get("wind_speed_10m", [7.0] * len(slots_data))
         temps = weather_data.get("temperature_2m", [12.0] * len(slots_data))
         solars = weather_data.get("direct_normal_irradiance", [0.0] * len(slots_data))
+        carbon_lookup = _carbon_by_start(carbon_data)
+        weather_source = str(weather_data.get("_tempo_source", "unspecified"))
 
         features = []
         for i, slot in enumerate(slots_data):
-            time_str = slot.get("valid_from", "")
-            # Approximate hour index
-            hour = (i % 48) / 2.0
+            slot_time = _parse_utc_timestamp(slot.get("valid_from"))
+            hour = (
+                slot_time.hour + slot_time.minute / 60.0
+                if slot_time is not None
+                else (i % 48) / 2.0
+            )
             w_idx = min(i // 2, len(winds) - 1)
             features.append([
                 np.sin(2 * np.pi * hour / 24),
@@ -96,9 +250,19 @@ class ForecastEngine:
             # Adjust predicted quantiles relative to Octopus published rate if present
             spread = max(1.5, (p90[i] - p10[i]) / 2.0)
             
-            p10_val = round(max(-5.0, base_rate - spread * 0.85), 2)
             p50_val = round(base_rate, 2)
-            p90_val = round(base_rate + spread * 1.15, 2)
+            p10_val = round(min(p50_val, base_rate - spread * 0.85), 2)
+            p90_val = round(max(p50_val, base_rate + spread * 1.15), 2)
+            slot_start = _parse_utc_timestamp(slot.get("valid_from"))
+            carbon_match = carbon_lookup.get(slot_start) if slot_start is not None else None
+            if carbon_match is None:
+                carbon_intensity = max(
+                    30,
+                    int(180 - p10_val * 1.8 + np.sin(i / 5) * 20),
+                )
+                carbon_source = "model_estimate"
+            else:
+                carbon_intensity, carbon_source = carbon_match
 
             results.append({
                 "slot_index": i,
@@ -108,9 +272,12 @@ class ForecastEngine:
                 "p10": p10_val,
                 "p50": p50_val,
                 "p90": p90_val,
-                "carbon_intensity": max(30, int(180 - p10_val * 1.8 + np.sin(i / 5) * 20)),
+                "carbon_intensity": carbon_intensity,
+                "price_source": str(slot.get("_tempo_source", "unspecified")),
+                "carbon_source": carbon_source,
+                "weather_source": weather_source,
                 "wind_ms": round(winds[min(i // 2, len(winds) - 1)], 1),
-                "is_auction_cleared": i < 28 # Day-ahead auction clears at 16:00 for next day
+                "is_auction_cleared": slot.get("_tempo_source") == "octopus_live",
             })
 
         return results

@@ -6,17 +6,29 @@ Tempo Google OR-Tools Scheduler & Multi-Household Grid Staggering Simulator
 """
 
 from dataclasses import dataclass
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 import math
 import random
 import unicodedata
 import numpy as np
-from typing import Dict, List, Any, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
 from ortools.sat.python import cp_model
 
-from schemas import ApplianceType, EvidenceQuotes, ResponseStatus, ScheduleExtractionSchema
+from forecast_engine import evaluate_selected_schedule_risk
+from schemas import (
+    ApplianceType,
+    EvidenceQuotes,
+    ParseAndScheduleResponse,
+    ParsedConstraints,
+    ResponseStatus,
+    RiskAppetite,
+    ScenarioComparison,
+    ScenarioResult,
+    ScheduleExtractionSchema,
+)
 
 
 UTC = timezone.utc
@@ -421,6 +433,692 @@ def validate_gemini_output(
         clarification_message=None,
         validation_warning=validation_warning,
         validated=validated,
+    )
+
+
+class ForecastDataError(ValueError):
+    """Forecast slots cannot be converted into safe optimizer input."""
+
+
+class ScheduleOptimizationError(ValueError):
+    """Validated constraints cannot be scheduled in the supplied forecast."""
+
+
+class SolverOptimalityError(RuntimeError):
+    """OR-Tools did not prove that the returned household schedule is optimal."""
+
+
+@dataclass(frozen=True)
+class ForecastSlot:
+    """One normalized UTC half-hour supplied by the forecast pipeline."""
+
+    start_utc: datetime
+    end_utc: datetime
+    spot_rate_pence_per_kwh: float
+    p10_pence_per_kwh: float
+    p50_pence_per_kwh: float
+    p90_pence_per_kwh: float
+    carbon_g_per_kwh: float
+    is_auction_cleared: bool
+    price_source: str
+    carbon_source: str
+    weather_source: str
+
+
+@dataclass(frozen=True)
+class ScheduleAllocation:
+    """Energy assigned to a forecast slot by the household optimizer."""
+
+    slot: ForecastSlot
+    energy_kwh: float
+
+
+def _parse_forecast_timestamp(value: Any, field_name: str) -> datetime:
+    if not isinstance(value, str) or not value.strip():
+        raise ForecastDataError(f"{field_name} must be an ISO-8601 UTC timestamp")
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise ForecastDataError(
+            f"{field_name} must be an ISO-8601 UTC timestamp"
+        ) from exc
+    try:
+        return _require_utc(parsed, field_name)
+    except ValueError as exc:
+        raise ForecastDataError(str(exc)) from exc
+
+
+def _finite_forecast_number(slot: Dict[str, Any], field_name: str) -> float:
+    value = slot.get(field_name)
+    if isinstance(value, bool):
+        raise ForecastDataError(f"forecast field {field_name!r} must be numeric")
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ForecastDataError(
+            f"forecast field {field_name!r} must be numeric"
+        ) from exc
+    if not math.isfinite(number):
+        raise ForecastDataError(f"forecast field {field_name!r} must be finite")
+    return number
+
+
+def normalize_forecast_slots(
+    raw_slots: Sequence[Dict[str, Any]],
+    *,
+    start_time_utc: datetime,
+) -> Tuple[ForecastSlot, ...]:
+    """Validate, sort, and trim forecast data for deterministic scheduling."""
+
+    start_utc = _require_utc(start_time_utc, "start_time_utc")
+    normalized_slots: List[ForecastSlot] = []
+
+    for index, raw_slot in enumerate(raw_slots):
+        if not isinstance(raw_slot, dict):
+            raise ForecastDataError(f"forecast slot {index} must be an object")
+        slot_start = _parse_forecast_timestamp(
+            raw_slot.get("valid_from"),
+            f"forecast slot {index} valid_from",
+        )
+        slot_end = _parse_forecast_timestamp(
+            raw_slot.get("valid_to"),
+            f"forecast slot {index} valid_to",
+        )
+        if (slot_end - slot_start).total_seconds() != HALF_HOUR_SECONDS:
+            raise ForecastDataError(
+                f"forecast slot {index} must span exactly 30 minutes"
+            )
+
+        p10 = _finite_forecast_number(raw_slot, "p10")
+        p50 = _finite_forecast_number(raw_slot, "p50")
+        p90 = _finite_forecast_number(raw_slot, "p90")
+        if not p10 <= p50 <= p90:
+            raise ForecastDataError(
+                f"forecast slot {index} must satisfy p10 <= p50 <= p90"
+            )
+        carbon = _finite_forecast_number(raw_slot, "carbon_intensity")
+        if carbon < 0:
+            raise ForecastDataError(
+                f"forecast slot {index} carbon_intensity cannot be negative"
+            )
+
+        if slot_end <= start_utc:
+            continue
+        normalized_slots.append(
+            ForecastSlot(
+                start_utc=slot_start,
+                end_utc=slot_end,
+                spot_rate_pence_per_kwh=_finite_forecast_number(
+                    raw_slot,
+                    "spot_rate",
+                ),
+                p10_pence_per_kwh=p10,
+                p50_pence_per_kwh=p50,
+                p90_pence_per_kwh=p90,
+                carbon_g_per_kwh=carbon,
+                is_auction_cleared=bool(raw_slot.get("is_auction_cleared", False)),
+                price_source=str(raw_slot.get("price_source", "unspecified")),
+                carbon_source=str(raw_slot.get("carbon_source", "unspecified")),
+                weather_source=str(raw_slot.get("weather_source", "unspecified")),
+            )
+        )
+
+    normalized_slots.sort(key=lambda slot: slot.start_utc)
+    if not normalized_slots:
+        raise ForecastDataError(
+            "the forecast contains no complete half-hour slots at or after the request time"
+        )
+
+    for previous, current in zip(normalized_slots, normalized_slots[1:]):
+        if current.start_utc == previous.start_utc:
+            raise ForecastDataError(
+                f"the forecast contains a duplicate slot at {_format_utc(current.start_utc)}"
+            )
+        if current.start_utc < previous.end_utc:
+            raise ForecastDataError("forecast slots overlap")
+
+    return tuple(normalized_slots)
+
+
+def _local_minute_is_quiet(
+    utc_value: datetime,
+    quiet_start: time,
+    quiet_end: time,
+) -> bool:
+    local = utc_value.astimezone(LONDON_TIMEZONE)
+    minute = local.hour * 60 + local.minute
+    start_minute = quiet_start.hour * 60 + quiet_start.minute
+    end_minute = quiet_end.hour * 60 + quiet_end.minute
+    if start_minute < end_minute:
+        return start_minute <= minute < end_minute
+    return minute >= start_minute or minute < end_minute
+
+
+def _slot_overlaps_quiet_hours(
+    slot: ForecastSlot,
+    constraints: ValidatedScheduleConstraints,
+) -> bool:
+    if constraints.quiet_hours_start is None or constraints.quiet_hours_end is None:
+        return False
+    current = slot.start_utc
+    while current < slot.end_utc:
+        if _local_minute_is_quiet(
+            current,
+            constraints.quiet_hours_start,
+            constraints.quiet_hours_end,
+        ):
+            return True
+        current += timedelta(minutes=1)
+    return False
+
+
+def _energy_pattern_wh(
+    constraints: ValidatedScheduleConstraints,
+) -> Tuple[int, int, int, int]:
+    total_wh = int(round(constraints.energy_kwh * 1000.0))
+    capacity_wh = int(round(constraints.max_power_kw * 0.5 * 1000.0))
+    full_slots, remainder_wh = divmod(total_wh, capacity_wh)
+    slots_needed = full_slots + (1 if remainder_wh else 0)
+    if total_wh <= 0 or capacity_wh <= 0 or slots_needed != constraints.required_slots:
+        raise ScheduleOptimizationError(
+            "the validated energy request cannot be represented in half-hour slots"
+        )
+    return total_wh, capacity_wh, full_slots, remainder_wh
+
+
+def _risk_rate(slot: ForecastSlot, risk_appetite: str) -> float:
+    if risk_appetite == RiskAppetite.SAFE.value:
+        return slot.p90_pence_per_kwh
+    if risk_appetite == RiskAppetite.AGGRESSIVE.value:
+        return slot.p10_pence_per_kwh
+    return slot.p50_pence_per_kwh + 0.25 * (
+        slot.p90_pence_per_kwh - slot.p50_pence_per_kwh
+    )
+
+
+def _normalize_values(values: Sequence[float]) -> List[float]:
+    minimum = min(values)
+    maximum = max(values)
+    spread = maximum - minimum
+    if spread <= 1e-12:
+        return [0.0 for _ in values]
+    return [(value - minimum) / spread for value in values]
+
+
+def _objective_coefficients(
+    slots: Sequence[ForecastSlot],
+    *,
+    carbon_weight: float,
+    risk_appetite: str,
+) -> Dict[datetime, int]:
+    risk_values = [_risk_rate(slot, risk_appetite) for slot in slots]
+    carbon_values = [slot.carbon_g_per_kwh for slot in slots]
+    expected_prices = [slot.p50_pence_per_kwh for slot in slots]
+    risk_normalized = _normalize_values(risk_values)
+    carbon_normalized = _normalize_values(carbon_values)
+    price_normalized = _normalize_values(expected_prices)
+
+    coefficients: Dict[datetime, int] = {}
+    for index, slot in enumerate(slots):
+        primary_score = (
+            (1.0 - carbon_weight) * risk_normalized[index]
+            + carbon_weight * carbon_normalized[index]
+        )
+        primary = int(round(primary_score * 1_000_000))
+        expected_cost_tiebreak = int(round(price_normalized[index] * 1_000))
+        coefficients[slot.start_utc] = (
+            primary * 1_000_000 + expected_cost_tiebreak * 100 + index
+        )
+    return coefficients
+
+
+def _solve_model(model: cp_model.CpModel) -> cp_model.CpSolver:
+    solver = cp_model.CpSolver()
+    solver.parameters.num_search_workers = 1
+    solver.parameters.random_seed = 0
+    solver.parameters.max_time_in_seconds = 5.0
+    status = solver.Solve(model)
+    if status == cp_model.FEASIBLE:
+        raise SolverOptimalityError(
+            "OR-Tools found a feasible schedule but did not prove it optimal"
+        )
+    if status != cp_model.OPTIMAL:
+        raise ScheduleOptimizationError(
+            "OR-Tools could not find a feasible appliance schedule"
+        )
+    return solver
+
+
+def _candidate_slots(
+    slots: Sequence[ForecastSlot],
+    constraints: ValidatedScheduleConstraints,
+    deadline_utc: datetime,
+) -> List[ForecastSlot]:
+    first_start = _first_full_half_hour_at_or_after(constraints.start_time_utc)
+    return [
+        slot
+        for slot in slots
+        if slot.start_utc >= first_start
+        and slot.end_utc <= deadline_utc
+        and not _slot_overlaps_quiet_hours(slot, constraints)
+    ]
+
+
+def _contiguous_windows(
+    slots: Sequence[ForecastSlot],
+    slots_needed: int,
+) -> List[Tuple[ForecastSlot, ...]]:
+    windows: List[Tuple[ForecastSlot, ...]] = []
+    for start_index in range(len(slots) - slots_needed + 1):
+        window = tuple(slots[start_index : start_index + slots_needed])
+        if all(
+            previous.end_utc == current.start_utc
+            for previous, current in zip(window, window[1:])
+        ):
+            windows.append(window)
+    return windows
+
+
+def _optimize_contiguous(
+    slots: Sequence[ForecastSlot],
+    constraints: ValidatedScheduleConstraints,
+    coefficients: Dict[datetime, int],
+) -> Tuple[ScheduleAllocation, ...]:
+    _, capacity_wh, full_slots, remainder_wh = _energy_pattern_wh(constraints)
+    windows = _contiguous_windows(slots, constraints.required_slots)
+    if not windows:
+        raise ScheduleOptimizationError(
+            "No uninterrupted run fits before this deadline after quiet hours are applied."
+        )
+
+    energy_wh = [capacity_wh] * full_slots
+    if remainder_wh:
+        energy_wh.append(remainder_wh)
+
+    model = cp_model.CpModel()
+    choices = [model.NewBoolVar(f"window_{index}") for index in range(len(windows))]
+    model.Add(sum(choices) == 1)
+    window_scores = [
+        sum(
+            coefficients[slot.start_utc] * slot_energy_wh
+            for slot, slot_energy_wh in zip(window, energy_wh)
+        )
+        for window in windows
+    ]
+    model.Minimize(sum(score * choice for score, choice in zip(window_scores, choices)))
+    solver = _solve_model(model)
+    selected_index = next(
+        index for index, choice in enumerate(choices) if solver.Value(choice)
+    )
+    return tuple(
+        ScheduleAllocation(slot=slot, energy_kwh=slot_energy_wh / 1000.0)
+        for slot, slot_energy_wh in zip(windows[selected_index], energy_wh)
+    )
+
+
+def _optimize_split(
+    slots: Sequence[ForecastSlot],
+    constraints: ValidatedScheduleConstraints,
+    coefficients: Dict[datetime, int],
+) -> Tuple[ScheduleAllocation, ...]:
+    _, capacity_wh, full_slots, remainder_wh = _energy_pattern_wh(constraints)
+    if len(slots) < constraints.required_slots:
+        raise ScheduleOptimizationError(
+            "Too few usable half-hour slots remain before this deadline after quiet "
+            "hours are applied."
+        )
+
+    model = cp_model.CpModel()
+    full_vars = [model.NewBoolVar(f"full_{index}") for index in range(len(slots))]
+    model.Add(sum(full_vars) == full_slots)
+    partial_vars: List[cp_model.IntVar] = []
+    if remainder_wh:
+        partial_vars = [
+            model.NewBoolVar(f"partial_{index}") for index in range(len(slots))
+        ]
+        model.Add(sum(partial_vars) == 1)
+        for full_var, partial_var in zip(full_vars, partial_vars):
+            model.Add(full_var + partial_var <= 1)
+
+    objective_terms = [
+        coefficients[slot.start_utc] * capacity_wh * full_var
+        for slot, full_var in zip(slots, full_vars)
+    ]
+    if remainder_wh:
+        objective_terms.extend(
+            coefficients[slot.start_utc] * remainder_wh * partial_var
+            for slot, partial_var in zip(slots, partial_vars)
+        )
+    model.Minimize(sum(objective_terms))
+    solver = _solve_model(model)
+
+    allocations: List[ScheduleAllocation] = []
+    for index, slot in enumerate(slots):
+        if solver.Value(full_vars[index]):
+            allocations.append(
+                ScheduleAllocation(slot=slot, energy_kwh=capacity_wh / 1000.0)
+            )
+        elif remainder_wh and solver.Value(partial_vars[index]):
+            allocations.append(
+                ScheduleAllocation(slot=slot, energy_kwh=remainder_wh / 1000.0)
+            )
+    allocations.sort(key=lambda allocation: allocation.slot.start_utc)
+    return tuple(allocations)
+
+
+def _optimize_scenario(
+    slots: Sequence[ForecastSlot],
+    constraints: ValidatedScheduleConstraints,
+    deadline_utc: datetime,
+    *,
+    carbon_weight: float,
+    risk_appetite: str,
+) -> Tuple[ScheduleAllocation, ...]:
+    candidates = _candidate_slots(slots, constraints, deadline_utc)
+    if len(candidates) < constraints.required_slots:
+        raise ScheduleOptimizationError(
+            "Too few usable half-hour slots remain before this deadline after quiet "
+            "hours are applied."
+        )
+    coefficients = _objective_coefficients(
+        candidates,
+        carbon_weight=carbon_weight,
+        risk_appetite=risk_appetite,
+    )
+    if constraints.is_contiguous:
+        return _optimize_contiguous(candidates, constraints, coefficients)
+    return _optimize_split(candidates, constraints, coefficients)
+
+
+def _baseline_allocations(
+    slots: Sequence[ForecastSlot],
+    constraints: ValidatedScheduleConstraints,
+) -> Tuple[ScheduleAllocation, ...]:
+    total_wh, _, _, _ = _energy_pattern_wh(constraints)
+    start_index = next(
+        (
+            index
+            for index, slot in enumerate(slots)
+            if slot.start_utc <= constraints.start_time_utc < slot.end_utc
+        ),
+        None,
+    )
+    if start_index is None:
+        raise ForecastDataError(
+            "the forecast does not contain the tariff slot active at the requested "
+            f"run-now time {_format_utc(constraints.start_time_utc)}"
+        )
+
+    remaining_wh = total_wh
+    allocations: List[ScheduleAllocation] = []
+    expected_next_start: Optional[datetime] = None
+    for index in range(start_index, len(slots)):
+        slot = slots[index]
+        if expected_next_start is not None and slot.start_utc != expected_next_start:
+            break
+        active_start = max(slot.start_utc, constraints.start_time_utc)
+        active_hours = (slot.end_utc - active_start).total_seconds() / 3600.0
+        available_wh = int(round(constraints.max_power_kw * active_hours * 1000.0))
+        allocated_wh = min(remaining_wh, available_wh)
+        if allocated_wh > 0:
+            allocations.append(
+                ScheduleAllocation(slot=slot, energy_kwh=allocated_wh / 1000.0)
+            )
+            remaining_wh -= allocated_wh
+        if remaining_wh == 0:
+            return tuple(allocations)
+        expected_next_start = slot.end_utc
+
+    raise ForecastDataError(
+        "the forecast does not cover enough consecutive time to calculate the "
+        "complete immediate-start baseline"
+    )
+
+
+def _expected_cost_pence(allocations: Sequence[ScheduleAllocation]) -> float:
+    return sum(
+        allocation.slot.p50_pence_per_kwh * allocation.energy_kwh
+        for allocation in allocations
+    )
+
+
+def _expected_carbon_g(allocations: Sequence[ScheduleAllocation]) -> float:
+    return sum(
+        allocation.slot.carbon_g_per_kwh * allocation.energy_kwh
+        for allocation in allocations
+    )
+
+
+def _round_gbp(value: float) -> float:
+    return float(
+        Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    )
+
+
+def _round_whole_pence(value: float) -> int:
+    return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _same_allocations(
+    first: Sequence[ScheduleAllocation],
+    second: Sequence[ScheduleAllocation],
+) -> bool:
+    first_values = [
+        (allocation.slot.start_utc, round(allocation.energy_kwh, 9))
+        for allocation in first
+    ]
+    second_values = [
+        (allocation.slot.start_utc, round(allocation.energy_kwh, 9))
+        for allocation in second
+    ]
+    return first_values == second_values
+
+
+def _evaluate_selected_schedule_risk(
+    allocations: Sequence[ScheduleAllocation],
+    baseline_allocations: Sequence[ScheduleAllocation],
+    *,
+    random_seed: int,
+    simulations: int = 1000,
+) -> Tuple[float, float]:
+    if _same_allocations(allocations, baseline_allocations):
+        return 0.0, 0.0
+    return evaluate_selected_schedule_risk(
+        [
+            {
+                "p10": allocation.slot.p10_pence_per_kwh,
+                "p50": allocation.slot.p50_pence_per_kwh,
+                "p90": allocation.slot.p90_pence_per_kwh,
+                "energy_kwh": allocation.energy_kwh,
+            }
+            for allocation in allocations
+        ],
+        baseline_cost_pence=_expected_cost_pence(baseline_allocations),
+        random_seed=random_seed,
+        simulations=simulations,
+    )
+
+
+def _format_local_deadline(local_value: str, utc_value: datetime) -> str:
+    local = utc_value.astimezone(LONDON_TIMEZONE)
+    return f"{local_value} {local.tzname()}"
+
+
+def _format_slot_start(value: datetime) -> str:
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%MZ")
+
+
+def forecast_provenance_warning(slots: Sequence[ForecastSlot]) -> Optional[str]:
+    """Describe non-live inputs so generated data cannot be mistaken for live data."""
+
+    price_sources = {slot.price_source for slot in slots}
+    carbon_sources = {slot.carbon_source for slot in slots}
+    weather_sources = {slot.weather_source for slot in slots}
+    warnings: List[str] = []
+    if price_sources != {"octopus_live"}:
+        warnings.append(
+            "Electricity prices include generated or unverified fallback data; "
+            "costs and savings are demo estimates rather than confirmed live Octopus rates."
+        )
+    if carbon_sources != {"national_grid_live"}:
+        warnings.append(
+            "Carbon values include generated or model-derived estimates rather than "
+            "a complete timestamp-aligned National Grid forecast."
+        )
+    if weather_sources != {"open_meteo_live"}:
+        warnings.append(
+            "Price uncertainty uses generated or unverified weather inputs."
+        )
+    return " ".join(warnings) if warnings else None
+
+
+def _combine_warnings(*warnings: Optional[str]) -> Optional[str]:
+    unique = list(dict.fromkeys(warning for warning in warnings if warning))
+    return " ".join(unique) if unique else None
+
+
+def run_multi_scenario_schedule(
+    constraints: ValidatedScheduleConstraints,
+    forecast_slots: Sequence[ForecastSlot],
+    *,
+    carbon_weight: float,
+    risk_appetite: str,
+    validation_warning: Optional[str] = None,
+) -> ParseAndScheduleResponse:
+    """Solve the earliest, expected, and latest interpretations independently."""
+
+    if not 0.0 <= carbon_weight <= 1.0:
+        raise ValueError("carbon_weight must be between 0 and 1")
+    risk_value = (
+        risk_appetite.value
+        if isinstance(risk_appetite, RiskAppetite)
+        else str(risk_appetite)
+    )
+    valid_risk_values = {value.value for value in RiskAppetite}
+    if risk_value not in valid_risk_values:
+        raise ValueError(f"unknown risk appetite: {risk_value}")
+    if not forecast_slots:
+        raise ForecastDataError("at least one normalized forecast slot is required")
+
+    response_warning = _combine_warnings(
+        validation_warning,
+        forecast_provenance_warning(forecast_slots),
+    )
+
+    baseline = _baseline_allocations(forecast_slots, constraints)
+    baseline_cost_gbp = _round_gbp(_expected_cost_pence(baseline) / 100.0)
+    scenario_specs = (
+        (
+            "earliest_interpretation",
+            "Earliest Interpretation",
+            constraints.earliest_local_deadline,
+            constraints.earliest_utc,
+        ),
+        (
+            "expected_interpretation",
+            "Expected Interpretation",
+            constraints.expected_local_deadline,
+            constraints.expected_utc,
+        ),
+        (
+            "latest_interpretation",
+            "Latest Interpretation",
+            constraints.latest_local_deadline,
+            constraints.latest_utc,
+        ),
+    )
+
+    scenario_results: Dict[str, ScenarioResult] = {}
+    for scenario_index, (key, label, local_value, deadline_utc) in enumerate(
+        scenario_specs
+    ):
+        try:
+            allocations = _optimize_scenario(
+                forecast_slots,
+                constraints,
+                deadline_utc,
+                carbon_weight=carbon_weight,
+                risk_appetite=risk_value,
+            )
+        except ScheduleOptimizationError as exc:
+            raise ScheduleOptimizationError(f"{label}: {exc}") from exc
+
+        expected_cost_gbp = _round_gbp(_expected_cost_pence(allocations) / 100.0)
+        savings_gbp = _round_gbp(baseline_cost_gbp - expected_cost_gbp)
+        wait_probability, worst_case_loss = _evaluate_selected_schedule_risk(
+            allocations,
+            baseline,
+            random_seed=1337 + scenario_index,
+        )
+        local_clock = deadline_utc.astimezone(LONDON_TIMEZONE).strftime("%H:%M")
+        scenario_results[key] = ScenarioResult(
+            label=f"{label} (By {local_clock})",
+            deadline_local=_format_local_deadline(local_value, deadline_utc),
+            deadline_utc=deadline_utc,
+            estimated_cost_gbp=expected_cost_gbp,
+            baseline_cost_gbp=baseline_cost_gbp,
+            savings_vs_now_gbp=savings_gbp,
+            wait_probability_pct=wait_probability,
+            worst_case_loss_pence=worst_case_loss,
+            carbon_g_co2=round(_expected_carbon_g(allocations), 1),
+            recommended_slots_utc=[
+                _format_slot_start(allocation.slot.start_utc)
+                for allocation in allocations
+            ],
+            recommended_slot_energy_kwh=[
+                round(allocation.energy_kwh, 3) for allocation in allocations
+            ],
+        )
+
+    earliest_result = scenario_results["earliest_interpretation"]
+    expected_result = scenario_results["expected_interpretation"]
+    latest_result = scenario_results["latest_interpretation"]
+    comparison = ScenarioComparison(
+        earliest_interpretation=earliest_result,
+        expected_interpretation=expected_result,
+        latest_interpretation=latest_result,
+    )
+    flexibility_spread_pence = _round_whole_pence(
+        (earliest_result.estimated_cost_gbp - latest_result.estimated_cost_gbp)
+        * 100
+    )
+
+    parsed = ParsedConstraints(
+        appliance=f"{constraints.appliance_label} ({constraints.max_power_kw:g} kW)",
+        energy_kwh=round(constraints.energy_kwh, 3),
+        is_contiguous=constraints.is_contiguous,
+        earliest_local=_format_local_deadline(
+            constraints.earliest_local_deadline,
+            constraints.earliest_utc,
+        ),
+        expected_local=_format_local_deadline(
+            constraints.expected_local_deadline,
+            constraints.expected_utc,
+        ),
+        latest_local=_format_local_deadline(
+            constraints.latest_local_deadline,
+            constraints.latest_utc,
+        ),
+        evidence=constraints.evidence_quotes,
+        read_back_summary=(
+            f"Scheduling {constraints.energy_kwh:.2f} kWh for a "
+            f"{constraints.appliance_label.lower()} at up to "
+            f"{constraints.max_power_kw:g} kW. Tempo compared the earliest, "
+            "expected, and latest completion interpretations against the "
+            "available half-hour price forecast."
+        ),
+    )
+    return ParseAndScheduleResponse(
+        status=ResponseStatus.SUCCESS,
+        needs_clarification=False,
+        clarification_message=None,
+        validation_warning=response_warning,
+        parsed_constraints=parsed,
+        scenarios=comparison,
+        flexibility_spread_pence=flexibility_spread_pence,
     )
 
 class GridScheduler:

@@ -101,7 +101,10 @@ class DataService:
                 if resp_fwd.status_code == 200:
                     fwd_data = resp_fwd.json().get("data", [])
                     if fwd_data:
-                        return fwd_data
+                        return [
+                            {**item, "_tempo_source": "national_grid_live"}
+                            for item in fwd_data
+                        ]
         except Exception:
             pass
         return self._generate_fallback_carbon_series()
@@ -112,7 +115,9 @@ class DataService:
             url = f"https://api.open-meteo.com/v1/forecast?latitude={OXFORD_LAT}&longitude={OXFORD_LON}&hourly=temperature_2m,wind_speed_10m,direct_normal_irradiance&timezone=Europe%2FLondon&forecast_days=2"
             resp = requests.get(url, timeout=3)
             if resp.status_code == 200:
-                return resp.json().get("hourly", {})
+                hourly = resp.json().get("hourly", {})
+                if hourly:
+                    return {**hourly, "_tempo_source": "open_meteo_live"}
         except Exception:
             pass
         return self._generate_fallback_weather_series()
@@ -126,13 +131,21 @@ class DataService:
             if resp.status_code == 200:
                 results = resp.json().get("results", [])
                 if results and len(results) >= 24:
-                    return results
+                    return [
+                        {**item, "_tempo_source": "octopus_live"}
+                        for item in results
+                    ]
         except Exception:
             pass
         return self._generate_fallback_agile_series()
 
     def _generate_fallback_carbon_series(self) -> List[Dict[str, Any]]:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc).replace(
+            minute=0 if datetime.datetime.now(datetime.timezone.utc).minute < 30 else 30,
+            second=0,
+            microsecond=0,
+        )
+        rng = random.Random(int(now.timestamp() // 1800) + 101)
         series = []
         for i in range(48):
             t = now + datetime.timedelta(minutes=30 * i)
@@ -143,7 +156,7 @@ class DataService:
                 mix += 60
             elif 1 <= h <= 5:
                 mix -= 50
-            mix = int(max(40, mix + random.uniform(-10, 10)))
+            mix = int(max(40, mix + rng.uniform(-10, 10)))
             index_str = "very low" if mix < 70 else ("low" if mix < 130 else ("moderate" if mix < 210 else "high"))
             series.append({
                 "from": t.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -152,25 +165,37 @@ class DataService:
                     "forecast": mix,
                     "actual": mix if i == 0 else None,
                     "index": index_str
-                }
+                },
+                "_tempo_source": "generated_fallback",
             })
         return series
 
     def _generate_fallback_weather_series(self) -> Dict[str, Any]:
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.timezone.utc).replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        rng = random.Random(int(now.timestamp() // 3600) + 202)
         times = [(now + datetime.timedelta(hours=i)).strftime("%Y-%m-%dT%H:00") for i in range(48)]
-        temps = [round(11 + 5 * math.sin(i / 24 * 2 * math.pi) + random.uniform(-0.5, 0.5), 1) for i in range(48)]
-        winds = [round(5.5 + 4 * math.sin(i / 18) + random.uniform(-0.8, 0.8), 1) for i in range(48)]
+        temps = [round(11 + 5 * math.sin(i / 24 * 2 * math.pi) + rng.uniform(-0.5, 0.5), 1) for i in range(48)]
+        winds = [round(5.5 + 4 * math.sin(i / 18) + rng.uniform(-0.8, 0.8), 1) for i in range(48)]
         irradiance = [round(max(0.0, 500 * math.sin((i % 24 - 6) / 14 * math.pi)), 1) if 6 <= (i % 24) <= 20 else 0.0 for i in range(48)]
         return {
             "time": times,
             "temperature_2m": temps,
             "wind_speed_10m": winds,
-            "direct_normal_irradiance": irradiance
+            "direct_normal_irradiance": irradiance,
+            "_tempo_source": "generated_fallback",
         }
 
     def _generate_fallback_agile_series(self) -> List[Dict[str, Any]]:
-        now = datetime.datetime.now(datetime.timezone.utc).replace(minute=0 if datetime.datetime.now().minute < 30 else 30, second=0, microsecond=0)
+        now = datetime.datetime.now(datetime.timezone.utc).replace(
+            minute=0 if datetime.datetime.now(datetime.timezone.utc).minute < 30 else 30,
+            second=0,
+            microsecond=0,
+        )
+        rng = random.Random(int(now.timestamp() // 1800) + 303)
         rates = []
         for i in range(48):
             t_from = now + datetime.timedelta(minutes=30 * i)
@@ -184,16 +209,17 @@ class DataService:
                 rate = 6.8 + 2.2 * math.sin(i)
                 # Occasional negative pricing window on night 1
                 if 2 <= h <= 3:
-                    rate = -1.2 + random.uniform(0, 2.5)
+                    rate = -1.2 + rng.uniform(0, 2.5)
             elif 12 <= h <= 14:
-                rate = 14.2 + 2.0 * random.random()
+                rate = 14.2 + 2.0 * rng.random()
             else:
                 rate = 19.5 + 3.0 * math.sin(i / 3)
             
             rates.append({
                 "value_inc_vat": round(rate, 2),
                 "valid_from": t_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "valid_to": t_to.strftime("%Y-%m-%dT%H:%M:%SZ")
+                "valid_to": t_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "_tempo_source": "generated_fallback",
             })
         return rates
 
