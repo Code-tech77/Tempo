@@ -16,8 +16,8 @@ class ChartErrorBoundary extends Component {
   render() {
     if (this.state.hasError) {
       return (
-        <div className="flex items-center justify-center p-8 text-center text-slate-400 font-tech text-xs bg-[#040e1d] rounded-xl border border-slate-800">
-          Chart telemetry is rendering...
+        <div className="chart-message" role="status">
+          This chart could not be displayed.
         </div>
       );
     }
@@ -25,7 +25,7 @@ class ChartErrorBoundary extends Component {
   }
 }
 
-function PlotlyChartInner({ data, layout, config, style, className }) {
+function PlotlyChartInner({ data, layout, config, style, className, ariaLabel = 'Data chart' }) {
   const containerRef = useRef(null);
   const [plotError, setPlotError] = useState(false);
 
@@ -44,8 +44,8 @@ function PlotlyChartInner({ data, layout, config, style, className }) {
       paper_bgcolor: 'transparent',
       plot_bgcolor: 'transparent',
       font: {
-        family: 'JetBrains Mono, Space Grotesk, sans-serif',
-        color: '#94a3b8'
+        family: 'IBM Plex Sans, sans-serif',
+        color: '#565b72'
       },
       margin: { t: 40, r: 30, b: 50, l: 50 },
       autosize: true,
@@ -70,7 +70,7 @@ function PlotlyChartInner({ data, layout, config, style, className }) {
       if (containerRef.current && Plotly?.Plots?.resize) {
         try {
           Plotly.Plots.resize(containerRef.current);
-        } catch (_) {}
+        } catch {}
       }
     };
 
@@ -81,15 +81,15 @@ function PlotlyChartInner({ data, layout, config, style, className }) {
       if (containerRef.current && Plotly?.purge) {
         try {
           Plotly.purge(containerRef.current);
-        } catch (_) {}
+        } catch {}
       }
     };
   }, [data, layout, config]);
 
   if (plotError) {
     return (
-      <div className="flex items-center justify-center p-8 text-center text-slate-400 font-tech text-xs bg-[#040e1d] rounded-xl border border-slate-800">
-        Telemetry visualization loaded.
+      <div className="chart-message" role="status">
+        This chart could not be displayed.
       </div>
     );
   }
@@ -99,6 +99,8 @@ function PlotlyChartInner({ data, layout, config, style, className }) {
       ref={containerRef}
       style={{ width: '100%', height: '100%', minHeight: '340px', ...style }}
       className={className}
+      role="img"
+      aria-label={ariaLabel}
     />
   );
 }
