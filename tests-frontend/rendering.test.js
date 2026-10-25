@@ -25,9 +25,9 @@ test('successful schedule rendering shows recommendation, savings and all three 
   assert.match(markup, /Savings versus running now/);
   assert.match(markup, /£2\.06/);
   assert.match(markup, /£1\.08/);
-  assert.match(markup, /Earliest finish/);
-  assert.match(markup, /Expected finish/);
-  assert.match(markup, /Latest finish/);
+  assert.match(markup, /Earlier deadline/);
+  assert.match(markup, /Most likely deadline/);
+  assert.match(markup, /Later deadline/);
   assert.match(markup, /£1\.26 flexibility spread/);
   assert.match(markup, /Credit: £0\.12/);
   assert.match(markup, /2026-10-25T02:00Z UTC/);
@@ -49,7 +49,7 @@ test('clarification rendering displays the question and suppresses scenario card
   const markup = renderToStaticMarkup(React.createElement(ResponseOutcome, { response: clarificationFixture }));
   assert.match(markup, /How much energy should the EV receive/);
   assert.match(markup, /Your original description is still here/);
-  assert.doesNotMatch(markup, /Earliest finish|Expected finish|Latest finish/);
+  assert.doesNotMatch(markup, /Earlier deadline|Most likely deadline|Later deadline/);
 });
 
 test('mock transport is visibly identified as cached demo data', () => {
