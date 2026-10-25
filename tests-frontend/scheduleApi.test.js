@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildScheduleRequest, createScheduleTransport, formatSlot, getResponseMessage } from '../src/scheduling/scheduleApi.js';
 import { clarificationFixture, impossibleFixture, successFixture } from '../src/scheduling/scheduleFixtures.js';
+import { formatMoney, getBaselineCost } from '../src/scheduling/money.js';
 
 test('request construction mirrors the locked request and uses UTC', () => {
   const request = buildScheduleRequest({
@@ -16,9 +17,22 @@ test('request construction mirrors the locked request and uses UTC', () => {
   assert.throws(() => buildScheduleRequest({ userPrompt: 'valid text', carbonWeight: 2, riskAppetite: 'balanced' }), /between 0 and 1/);
 });
 
+test('live request construction uses the browser current UTC time', () => {
+  const before = Date.now();
+  const request = buildScheduleRequest({
+    userPrompt: 'Run the dishwasher tomorrow morning', carbonWeight: 0.3, riskAppetite: 'balanced',
+  });
+  const after = Date.now();
+  const requestTime = Date.parse(request.current_time_iso);
+  assert.ok(requestTime >= before && requestTime <= after);
+  assert.match(request.current_time_iso, /Z$/);
+});
+
 test('transport switches explicitly between fixture and live API', async () => {
   const mock = await createScheduleTransport('mock').submit({});
   assert.equal(mock.status, 'success');
+  assert.equal(createScheduleTransport('mock').mode, 'mock');
+  assert.equal(createScheduleTransport('api').mode, 'api');
   const originalFetch = globalThis.fetch;
   let captured;
   globalThis.fetch = async (url, options) => {
@@ -41,6 +55,23 @@ test('representative response states preserve the locked success and clarificati
   assert.equal(getResponseMessage(impossibleFixture), impossibleFixture.clarification_message);
   assert.throws(() => getResponseMessage({ status: 'success' }), /incomplete schedule/);
   assert.throws(() => getResponseMessage({ status: 'unknown' }), /unexpected response/);
+});
+
+test('scenario fixtures include reproducible baselines and preserve exact scenario keys', () => {
+  const expectedKeys = ['earliest_interpretation', 'expected_interpretation', 'latest_interpretation'];
+  assert.deepEqual(Object.keys(successFixture.scenarios), expectedKeys);
+  for (const scenario of Object.values(successFixture.scenarios)) {
+    assert.equal(typeof scenario.baseline_cost_gbp, 'number');
+    assert.ok(Math.abs((scenario.baseline_cost_gbp - scenario.estimated_cost_gbp) - scenario.savings_vs_now_gbp) < 1e-9);
+  }
+});
+
+test('money formatting supports credits, signed losses, and old-response baseline fallback', () => {
+  assert.equal(formatMoney(-0.12, { negativeAsCredit: true }), 'Credit: £0.12');
+  assert.equal(formatMoney(-0.12), '−£0.12');
+  assert.equal(formatMoney(0), '£0.00');
+  assert.equal(getBaselineCost({ estimated_cost_gbp: 0.98, savings_vs_now_gbp: 1.08 }), 2.06);
+  assert.equal(getBaselineCost({ estimated_cost_gbp: -0.12, baseline_cost_gbp: -0.4, savings_vs_now_gbp: 0.28 }), -0.4);
 });
 
 test('network and server failures are surfaced without falling back to mocks', async () => {

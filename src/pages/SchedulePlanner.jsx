@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { AlertCircle, ArrowRight, Check, Clock3, Leaf, LoaderCircle, RotateCcw, Shield, Sparkles, Zap } from 'lucide-react';
 import { buildScheduleRequest, createScheduleTransport, EXAMPLES, formatSlot, getResponseMessage } from '../scheduling/scheduleApi.js';
+import { formatMoney, getBaselineCost } from '../scheduling/money.js';
 import './SchedulePlanner.css';
 
 const transport = createScheduleTransport();
@@ -12,9 +13,8 @@ const SCENARIOS = [
   ['expected_interpretation', 'Expected finish', 'Your usual timing'],
   ['latest_interpretation', 'Latest finish', 'More time to save'],
 ];
-const money = value => `£${Number(value).toFixed(2)}`;
-
 function ScenarioCard({ scenario, recommended }) {
+  const baselineCost = getBaselineCost(scenario);
   return (
     <article className={`planner-scenario ${recommended ? 'is-recommended' : ''}`}>
       <div className="planner-scenario-head">
@@ -22,13 +22,16 @@ function ScenarioCard({ scenario, recommended }) {
         {recommended && <span className="planner-recommended"><Check size={13} /> Recommended</span>}
       </div>
       <div className="planner-scenario-price">
-        <strong>{money(scenario.estimated_cost_gbp)}</strong>
-        <span>estimated run cost</span>
+        <strong>{formatMoney(scenario.estimated_cost_gbp, { negativeAsCredit: true })}</strong>
+        <span>scheduled cost</span>
       </div>
-      <p className="planner-saving">Save {money(scenario.savings_vs_now_gbp)} <span>compared with running now</span></p>
+      <div className="planner-cost-comparison">
+        <p><span>Running-now baseline</span><strong>{formatMoney(baselineCost, { negativeAsCredit: true })}</strong></p>
+        <p><span>Savings versus running now</span><strong>{formatMoney(scenario.savings_vs_now_gbp)}</strong></p>
+      </div>
       <dl className="planner-metrics">
         <div><dt>Chance waiting costs less</dt><dd>{scenario.wait_probability_pct}%</dd></div>
-        <div><dt>Worst case loss</dt><dd>{scenario.worst_case_loss_pence}p</dd></div>
+        <div><dt>Worst case loss</dt><dd>{formatMoney(scenario.worst_case_loss_pence / 100)}</dd></div>
         <div><dt>Carbon impact</dt><dd>{Math.round(scenario.carbon_g_co2).toLocaleString()} g CO₂</dd></div>
         <div><dt>Deadline</dt><dd>{scenario.deadline_local}</dd></div>
       </dl>
@@ -43,13 +46,18 @@ function ScenarioCard({ scenario, recommended }) {
 export function Results({ response }) {
   const parsed = response.parsed_constraints;
   const recommended = response.scenarios.expected_interpretation;
+  const recommendedBaseline = getBaselineCost(recommended);
   return (
     <section className="planner-results" aria-labelledby="planner-results-title">
       {response.validation_warning && <div className="planner-notice warning" role="status"><AlertCircle size={18} /><p>{response.validation_warning}</p></div>}
       <div className="planner-result-hero">
         <div className="planner-result-icon"><Zap size={20} /></div>
         <div><p className="planner-eyebrow">Recommended schedule · expected timing</p><h2 id="planner-results-title">{recommended.recommended_slots_utc.map(slot => formatSlot(slot)).join(' · ')}</h2></div>
-        <div className="planner-result-cost"><span>Estimated cost</span><strong>{money(recommended.estimated_cost_gbp)}</strong><small>Save {money(recommended.savings_vs_now_gbp)} vs running now</small></div>
+        <dl className="planner-result-cost">
+          <div><dt>Scheduled cost</dt><dd>{formatMoney(recommended.estimated_cost_gbp, { negativeAsCredit: true })}</dd></div>
+          <div><dt>Running-now baseline</dt><dd>{formatMoney(recommendedBaseline, { negativeAsCredit: true })}</dd></div>
+          <div><dt>Savings versus running now</dt><dd>{formatMoney(recommended.savings_vs_now_gbp)}</dd></div>
+        </dl>
       </div>
       <div className="planner-readback">
         <div className="planner-readback-title"><Sparkles size={17} /><h3>Schedule summary</h3></div>
@@ -57,7 +65,7 @@ export function Results({ response }) {
         <div className="planner-readback-facts"><span>{LABELS[parsed.appliance] || parsed.appliance}</span><span>{parsed.energy_kwh} kWh</span><span>{parsed.is_contiguous ? 'One continuous cycle' : 'Can use separate slots'}</span></div>
         <details><summary>Check what we understood</summary><ul><li><b>Earliest:</b> “{parsed.evidence.earliest}”</li><li><b>Expected:</b> “{parsed.evidence.expected}”</li><li><b>Latest:</b> “{parsed.evidence.latest}”</li></ul></details>
       </div>
-      <div className="planner-flexibility"><div className="planner-flex-icon"><Leaf size={19} /></div><div><strong>{response.flexibility_spread_pence}p potential flexibility saving</strong><p>Difference between the earliest and latest schedule interpretations.</p></div></div>
+      <div className="planner-flexibility"><div className="planner-flex-icon"><Leaf size={19} /></div><div><strong>{formatMoney(response.flexibility_spread_pence / 100)} flexibility spread</strong><p>Scheduled-cost difference between the earliest and latest interpretations.</p></div></div>
       <div className="planner-scenario-heading"><div><p className="planner-eyebrow">Compare interpretations</p><h2>Three ways to read your deadline</h2></div><p>These are schedule interpretations, not probability ranges.</p></div>
       <div className="planner-scenario-grid">{SCENARIOS.map(([key, title, subtitle], index) => <ScenarioCard key={key} scenario={{ ...response.scenarios[key], label: `${title} · ${subtitle}` }} recommended={index === 1} />)}</div>
     </section>
@@ -66,6 +74,11 @@ export function Results({ response }) {
 
 export function ResponseOutcome({ response }) {
   return <section className={`planner-outcome ${response.status === 'impossible_constraint' ? 'impossible' : ''}`} role="status"><div className="planner-outcome-icon"><AlertCircle size={20} /></div><div><p className="planner-eyebrow">{response.status === 'impossible_constraint' ? 'Schedule cannot be met' : 'One more detail needed'}</p><h2>{response.clarification_message}</h2>{response.validation_warning && <p className="planner-warning-text">{response.validation_warning}</p>}<p className="planner-preserved">Your original description is still here. Edit it above and try again.</p></div></section>;
+}
+
+export function TransportDisclosure({ mode }) {
+  if (mode !== 'mock') return null;
+  return <div className="planner-mock-disclosure" role="status"><AlertCircle size={16} /><span><strong>Mock preview</strong> · Cached demo response. No live scheduling result is being shown.</span></div>;
 }
 
 export default function SchedulePlanner() {
@@ -96,11 +109,12 @@ export default function SchedulePlanner() {
   return (
     <div className="planner-page">
       <header className="planner-header"><div className="planner-kicker"><span className="planner-kicker-mark"><Zap size={14} /></span> HOME ENERGY PLANNER</div><h1>Make time work<br /><em>for your energy.</em></h1><p>Tell Tempo what needs power and when it needs to be ready. Compare the cost of different timings around your plans.</p></header>
+      <TransportDisclosure mode={transport.mode} />
       <div className="planner-layout">
         <form className="planner-form" onSubmit={submit}>
           <div className="planner-form-top"><div><span className="planner-step">01</span><h2>Your schedule</h2></div><span className="planner-private"><Shield size={14} /> Your plans guide the timing</span></div>
           <label className="planner-label" htmlFor="schedule-prompt">What do you need to run, and by when?</label>
-          <textarea id="schedule-prompt" rows="5" maxLength="4000" required minLength="3" value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="For example: Charge my EV with 14 kWh before I leave at 7:30am. It can charge in separate slots." aria-describedby="prompt-hint prompt-count" />
+          <textarea id="schedule-prompt" rows="5" maxLength="4000" required minLength="3" value={prompt} onChange={event => setPrompt(event.target.value)} placeholder="For example: Charge my EV with 14 kWh before I leave tomorrow at 7:30am. It can charge in separate slots." aria-describedby="prompt-hint prompt-count" />
           <div className="planner-input-meta"><span id="prompt-hint">Include energy or duration and a deadline.</span><span id="prompt-count">{prompt.length}/4000</span></div>
           <div className="planner-examples"><p>Try an example</p><div>{EXAMPLES.map(example => <button type="button" key={example.label} onClick={() => applyExample(example)}>{example.label}<ArrowRight size={13} /></button>)}</div></div>
           <div className="planner-settings">

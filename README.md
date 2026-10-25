@@ -289,10 +289,16 @@ VITE_TEMPO_MOCK_STATE=success
 
 Set `VITE_TEMPO_MOCK_STATE` to `success`, `clarification`, `impossible`,
 `network_error`, or `server_error` to inspect each state. The two error modes
-exercise retry handling; they do not call the real API. To use a separately
+exercise retry handling; they do not call the real API. Mock mode is visibly
+labelled as cached demo data in the planner. To use a separately
 hosted backend, set `VITE_TEMPO_API_URL` to its base URL; the client then posts
 to `/api/parse-and-schedule`. For the local backend, Vite already proxies `/api`
 to `http://127.0.0.1:8000`.
+
+The planner consumes the Stage D `baseline_cost_gbp` scenario field. During the
+parallel backend rollout it remains compatible with older responses by deriving
+that baseline as `estimated_cost_gbp + savings_vs_now_gbp` only when the explicit
+field is absent. Negative scheduled costs are displayed as electricity credits.
 
 ### Step 6 (optional): Add the Kaggle datasets
 

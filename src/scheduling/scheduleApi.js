@@ -4,9 +4,9 @@ import { clarificationFixture, impossibleFixture, serverErrorFixture, successFix
 /** @typedef {{user_prompt:string, current_time_iso:string, carbon_weight:number, risk_appetite:RiskAppetite}} ParseAndScheduleRequest */
 
 export const EXAMPLES = [
-  { label: 'EV charging', text: 'Charge my EV with 14 kWh before I leave at 7:30am. It can charge in separate half-hour slots.' },
-  { label: 'Dishwasher', text: 'Run the dishwasher for 2 hours, finished by 6:30am. Keep the cycle together.' },
-  { label: 'Washing machine', text: 'Run the washing machine for 90 minutes before 8am. It must run as one cycle.' },
+  { label: 'EV charging', text: 'Charge my EV with 14 kWh before I leave tomorrow at 7:30am. It can charge in separate half-hour slots.' },
+  { label: 'Dishwasher', text: 'Run the dishwasher for 2 hours, finished by 6:30am tomorrow. Keep the cycle together.' },
+  { label: 'Washing machine', text: 'Run the washing machine for 90 minutes before 8am tomorrow. It must run as one cycle.' },
 ];
 
 /** @param {{userPrompt:string, carbonWeight:number, riskAppetite:RiskAppetite, now?:Date}} values
@@ -71,8 +71,8 @@ async function apiTransport(request) {
 
 /** Explicit transport switch: mock failures never fall through to the live API. */
 export function createScheduleTransport(mode = import.meta.env?.VITE_TEMPO_TRANSPORT || 'api', mockState = MOCK_STATE) {
-  if (mode === 'mock') return { submit: () => mockTransport(mockState) };
-  if (mode === 'api') return { submit: apiTransport };
+  if (mode === 'mock') return { mode, submit: () => mockTransport(mockState) };
+  if (mode === 'api') return { mode, submit: apiTransport };
   throw new TypeError(`Unknown TEMPO transport mode: ${mode}`);
 }
 
